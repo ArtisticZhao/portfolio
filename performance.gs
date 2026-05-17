@@ -2,6 +2,7 @@
  * Ensure performance-related sheets exist with expected headers.
  * Sheets:
  * - CashFlow: manual external deposit/withdraw records
+ * - CashBalance: computed cash retained inside investment accounts
  * - NAV_Daily: daily account snapshot in CNY
  * - PnL_View: dashboard formulas
  *
@@ -17,6 +18,13 @@ function ensurePerformanceSheets_(spreadsheet) {
     "Currency",
     "Note",
     "AmountCNY"
+  ]);
+
+  ensureSheetWithHeader_(spreadsheet, "CashBalance", [
+    "Date",
+    "CashBalanceCNY",
+    "Currency",
+    "Note"
   ]);
 
   ensureSheetWithHeader_(spreadsheet, "NAV_Daily", [
@@ -92,7 +100,8 @@ function appendDailyNavSnapshot_(spreadsheet) {
 
   const equityValueCNY = computeEquityValueCNY_(spreadsheet);
   const netFlowCNY = getNetFlowCNYForDate_(spreadsheet, today);
-  const totalAssetCNY = equityValueCNY;
+  const cashBalanceCNY = updateCashBalanceForDate_(spreadsheet, today);
+  const totalAssetCNY = equityValueCNY + cashBalanceCNY;
 
   // Upsert by date to avoid duplicate rows when running repeatedly on same day.
   const lastRow = navSheet.getLastRow();
@@ -131,6 +140,176 @@ function appendDailyNavSnapshot_(spreadsheet) {
   );
 
   Logger.log(`NAV snapshot updated for ${todayKey}`);
+}
+
+function updateCashBalanceForDate_(spreadsheet, dateObj) {
+  const sheet = spreadsheet.getSheetByName("CashBalance");
+  if (!sheet) throw new Error('Sheet "CashBalance" not found');
+
+  const previous = getLatestCashBalanceBeforeDate_(spreadsheet, dateObj);
+  const cashFlowCNY = getCashFlowCNYBetweenDates_(
+    spreadsheet,
+    previous.date,
+    dateObj
+  );
+  const tradeFlowCNY = getTradeCashFlowCNYBetweenDates_(
+    spreadsheet,
+    previous.date,
+    dateObj
+  );
+  const balance = previous.balance + cashFlowCNY + tradeFlowCNY;
+
+  upsertCashBalance_(spreadsheet, dateObj, balance, [
+    previous.date ? `Prev cash ${formatDateKey_(previous.date)}: ${roundMoney_(previous.balance)}` : "No previous cash balance",
+    `External flow: ${roundMoney_(cashFlowCNY)}`,
+    `Trade flow: ${roundMoney_(tradeFlowCNY)}`
+  ].join("; "));
+
+  return balance;
+}
+
+function getLatestCashBalanceBeforeDate_(spreadsheet, dateObj) {
+  const sheet = spreadsheet.getSheetByName("CashBalance");
+  if (!sheet) return { date: null, balance: 0 };
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return { date: null, balance: 0 };
+
+  const header = values[0];
+  const col = name => header.indexOf(name);
+  const iDate = col("Date");
+  const iBalance = col("CashBalanceCNY");
+  if (iDate < 0 || iBalance < 0) {
+    throw new Error("CashBalance sheet must contain Date and CashBalanceCNY columns");
+  }
+
+  const targetMs = dateOnlyMs_(dateObj);
+  let bestDate = null;
+  let bestBalance = 0;
+  let bestMs = -Infinity;
+
+  for (let i = 1; i < values.length; i++) {
+    const d = values[i][iDate];
+    if (!d) continue;
+    const ms = dateOnlyMs_(d);
+    if (ms < targetMs && ms > bestMs) {
+      bestMs = ms;
+      bestDate = d;
+      bestBalance = Number(values[i][iBalance]) || 0;
+    }
+  }
+
+  return { date: bestDate, balance: bestBalance };
+}
+
+function upsertCashBalance_(spreadsheet, dateObj, balance, note) {
+  const sheet = spreadsheet.getSheetByName("CashBalance");
+  const targetKey = formatDateKey_(dateObj);
+  const lastRow = sheet.getLastRow();
+  const rows = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, 1).getValues() : [];
+
+  let targetRow = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if (!rows[i][0]) continue;
+    if (formatDateKey_(rows[i][0]) === targetKey) {
+      targetRow = i + 2;
+      break;
+    }
+  }
+
+  if (targetRow === -1) targetRow = lastRow + 1;
+
+  sheet.getRange(targetRow, 1, 1, 4).setValues([[
+    dateObj,
+    balance,
+    "CNY",
+    note
+  ]]);
+}
+
+function getCashFlowCNYBetweenDates_(spreadsheet, startDateExclusive, endDateInclusive) {
+  const sheet = spreadsheet.getSheetByName("CashFlow");
+  if (!sheet) return 0;
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return 0;
+
+  const header = values[0];
+  const col = name => header.indexOf(name);
+  const iDate = col("Date");
+  const iAmountCNY = col("AmountCNY");
+  if (iDate < 0 || iAmountCNY < 0) {
+    throw new Error("CashFlow sheet must contain Date and AmountCNY columns");
+  }
+
+  let sum = 0;
+  for (let i = 1; i < values.length; i++) {
+    const d = values[i][iDate];
+    if (!d || !isDateInWindow_(d, startDateExclusive, endDateInclusive)) continue;
+    sum += Number(values[i][iAmountCNY]) || 0;
+  }
+  return sum;
+}
+
+function getTradeCashFlowCNYBetweenDates_(spreadsheet, startDateExclusive, endDateInclusive) {
+  const sheet = spreadsheet.getSheetByName("Trades");
+  if (!sheet) return 0;
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return 0;
+
+  const header = values[0];
+  const col = name => header.indexOf(name);
+  const iDate = col("Date");
+  const iSide = col("Side");
+  const iQty = col("Quantity");
+  const iPrice = col("Price");
+  const iCurrency = col("Currency");
+  const iFee = col("Fee");
+  const iTax = col("Tax");
+  const iOtherCost = col("OtherCost");
+
+  if ([iDate, iSide, iQty, iPrice, iCurrency].some(i => i < 0)) {
+    throw new Error("Trades sheet must contain Date, Side, Quantity, Price, and Currency columns");
+  }
+
+  const fxMap = getFxToCnyMap_(spreadsheet);
+  let sum = 0;
+
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    if (!row[iDate] || !isDateInWindow_(row[iDate], startDateExclusive, endDateInclusive)) continue;
+
+    const side = String(row[iSide] || "").trim().toUpperCase();
+    const gross = (Number(row[iQty]) || 0) * (Number(row[iPrice]) || 0);
+    if (!side || gross <= 0) continue;
+
+    const fee = iFee >= 0 ? (Number(row[iFee]) || 0) : 0;
+    const tax = iTax >= 0 ? (Number(row[iTax]) || 0) : 0;
+    const otherCost = iOtherCost >= 0 ? (Number(row[iOtherCost]) || 0) : 0;
+    const currency = String(row[iCurrency] || "CNY").trim().toUpperCase();
+    const fx = fxMap[currency] || 1;
+
+    if (side === "BUY") {
+      sum -= (gross + fee + tax + otherCost) * fx;
+    } else if (side === "SELL") {
+      sum += (gross - fee - tax - otherCost) * fx;
+    }
+  }
+
+  return sum;
+}
+
+function isDateInWindow_(dateValue, startDateExclusive, endDateInclusive) {
+  const ms = dateOnlyMs_(dateValue);
+  const startMs = startDateExclusive ? dateOnlyMs_(startDateExclusive) : -Infinity;
+  const endMs = dateOnlyMs_(endDateInclusive);
+  return ms > startMs && ms <= endMs;
+}
+
+function dateOnlyMs_(d) {
+  const date = (d instanceof Date) ? d : new Date(d);
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
 }
 
 function computeEquityValueCNY_(spreadsheet) {

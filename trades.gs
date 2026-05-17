@@ -7,10 +7,175 @@ function getSpreadsheet_() {
   return SpreadsheetApp.getActiveSpreadsheet();
 }
 
+const TRADE_FEE_RULES_ = {
+  CN_COMMISSION_RATE: 0.00025,
+  CN_MIN_FEE: 5,
+  CN_STAMP_DUTY_SELL_RATE: 0.0005,
+  HK_TRADING_FEE_RATE: 0.0000565,
+  HK_SFC_LEVY_RATE: 0.000027,
+  HK_AFRC_LEVY_RATE: 0.0000015,
+  HK_CCASS_RATE: 0.000042,
+  HK_STAMP_DUTY_RATE: 0.001
+};
+
+function normalizeSymbol_(symbol) {
+  return String(symbol || "").trim().toUpperCase();
+}
+
+function inferMarketFromSymbol_(symbol) {
+  const s = normalizeSymbol_(symbol);
+  if (/^HKG:\d{4}$/.test(s)) return "HK";
+  if (/^\d{6}$/.test(s)) return "CN";
+  if (s) return "US";
+  return "";
+}
+
+function inferCurrencyFromSymbol_(symbol) {
+  const market = inferMarketFromSymbol_(symbol);
+  if (market === "CN") return "CNY";
+  if (market === "HK") return "HKD";
+  if (market === "US") return "USD";
+  return "";
+}
+
+function isCnFundOrEtfSymbol_(symbol) {
+  const s = normalizeSymbol_(symbol);
+  return /^(5\d{5}|1[56]\d{4})$/.test(s);
+}
+
+function roundMoney_(value) {
+  return Math.round((Number(value) || 0) * 100) / 100;
+}
+
+function calculateTradeCosts_(symbol, side, quantity, price) {
+  const market = inferMarketFromSymbol_(symbol);
+  const normalizedSide = String(side || "").trim().toUpperCase();
+  const gross = (Number(quantity) || 0) * (Number(price) || 0);
+  if (!market || gross <= 0) return { fee: 0, tax: 0, otherCost: 0 };
+
+  if (market === "CN") {
+    const fee = Math.max(
+      TRADE_FEE_RULES_.CN_MIN_FEE,
+      gross * TRADE_FEE_RULES_.CN_COMMISSION_RATE
+    );
+    const tax = normalizedSide === "SELL" && !isCnFundOrEtfSymbol_(symbol)
+      ? gross * TRADE_FEE_RULES_.CN_STAMP_DUTY_SELL_RATE
+      : 0;
+    return {
+      fee: roundMoney_(fee),
+      tax: roundMoney_(tax),
+      otherCost: 0
+    };
+  }
+
+  if (market === "HK") {
+    const feeRate =
+      TRADE_FEE_RULES_.HK_TRADING_FEE_RATE +
+      TRADE_FEE_RULES_.HK_SFC_LEVY_RATE +
+      TRADE_FEE_RULES_.HK_AFRC_LEVY_RATE +
+      TRADE_FEE_RULES_.HK_CCASS_RATE;
+    return {
+      fee: roundMoney_(gross * feeRate),
+      tax: Math.ceil(gross * TRADE_FEE_RULES_.HK_STAMP_DUTY_RATE),
+      otherCost: 0
+    };
+  }
+
+  return { fee: 0, tax: 0, otherCost: 0 };
+}
+
+function collectKnownTradeNames_(rows, iSymbol, iName) {
+  const names = {};
+  rows.forEach(row => {
+    const symbol = normalizeSymbol_(row[iSymbol]);
+    const name = String(row[iName] || "").trim();
+    if (symbol && name && !names[symbol]) names[symbol] = name;
+  });
+  return names;
+}
+
+/**
+ * Fill derived trade fields so new rows only need Date, Symbol, Side,
+ * Quantity, and Price. Existing non-empty cells are preserved.
+ */
+function fillTradeDerivedFields_(spreadsheet) {
+  const sheet = spreadsheet.getSheetByName("Trades");
+  if (!sheet) {
+    throw new Error('Sheet "Trades" not found');
+  }
+
+  const range = sheet.getDataRange();
+  const values = range.getValues();
+  if (values.length < 2) return {};
+
+  const header = values[0];
+  const rows = values.slice(1);
+  const col = name => header.indexOf(name);
+
+  const iName = col("Name");
+  const iSymbol = col("Symbol");
+  const iSide = col("Side");
+  const iQty = col("Quantity");
+  const iPrice = col("Price");
+  const iCurrency = col("Currency");
+  const iFee = col("Fee");
+  const iTax = col("Tax");
+  const iOtherCost = col("OtherCost");
+
+  if ([iName, iSymbol, iSide, iQty, iPrice, iCurrency, iFee, iTax, iOtherCost].some(i => i < 0)) {
+    throw new Error("Trades sheet must contain Name, Symbol, Side, Quantity, Price, Currency, Fee, Tax, and OtherCost columns");
+  }
+
+  const knownNames = collectKnownTradeNames_(rows, iSymbol, iName);
+  let updated = false;
+
+  rows.forEach(row => {
+    const symbol = normalizeSymbol_(row[iSymbol]);
+    if (!symbol) return;
+
+    if (!row[iName] && knownNames[symbol]) {
+      row[iName] = knownNames[symbol];
+      updated = true;
+    }
+
+    if (!row[iCurrency]) {
+      row[iCurrency] = inferCurrencyFromSymbol_(symbol);
+      updated = true;
+    }
+
+    const costs = calculateTradeCosts_(
+      symbol,
+      row[iSide],
+      row[iQty],
+      row[iPrice]
+    );
+
+    if (row[iFee] === "" || row[iFee] === null) {
+      row[iFee] = costs.fee;
+      updated = true;
+    }
+    if (row[iTax] === "" || row[iTax] === null) {
+      row[iTax] = costs.tax;
+      updated = true;
+    }
+    if (row[iOtherCost] === "" || row[iOtherCost] === null) {
+      row[iOtherCost] = costs.otherCost;
+      updated = true;
+    }
+  });
+
+  if (updated) {
+    range.setValues([header].concat(rows));
+    Logger.log("Trades derived fields updated.");
+  }
+
+  return knownNames;
+}
+
 /**
  * Build positions from Trades sheet using weighted average cost.
  * BUY increases quantity and cost.
- * SELL reduces quantity and cost at average cost, including sell fees.
+ * SELL reduces quantity and cost at average cost.
  * @param {Spreadsheet} spreadsheet
  * @return {Object} Map: symbol -> { quantity, cost }
  */
@@ -36,21 +201,23 @@ function buildPositionsFromTrades_(spreadsheet) {
   const iSide   = col("Side");
   const iQty    = col("Quantity");
   const iPrice  = col("Price");
-  const iFee    = header.includes("Fee") ? col("Fee") : -1;
-  const iTax    = header.includes("Tax") ? col("Tax") : -1;
+  const iFee       = header.includes("Fee") ? col("Fee") : -1;
+  const iTax       = header.includes("Tax") ? col("Tax") : -1;
+  const iOtherCost = header.includes("OtherCost") ? col("OtherCost") : -1;
 
   const positions = {};
 
   for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
     const r = rows[rowIdx];
-    const symbol = r[iSymbol];
+    const symbol = normalizeSymbol_(r[iSymbol]);
     if (!symbol) continue;
 
     const side  = String(r[iSide]).trim().toUpperCase();
     const qty   = Number(r[iQty]) || 0;
     const price = Number(r[iPrice]) || 0;
-    const fee   = iFee >= 0 ? (Number(r[iFee]) || 0) : 0;
-    const tax   = iTax >= 0 ? (Number(r[iTax]) || 0) : 0;
+    const fee       = iFee >= 0 ? (Number(r[iFee]) || 0) : 0;
+    const tax       = iTax >= 0 ? (Number(r[iTax]) || 0) : 0;
+    const otherCost = iOtherCost >= 0 ? (Number(r[iOtherCost]) || 0) : 0;
 
     if (!positions[symbol]) {
       positions[symbol] = { quantity: 0, cost: 0 };
@@ -60,7 +227,7 @@ function buildPositionsFromTrades_(spreadsheet) {
 
     if (side === "BUY") {
       p.quantity += qty;
-      p.cost += qty * price + fee + tax;
+      p.cost += qty * price + fee + tax + otherCost;
 
     } else if (side === "SELL") {
       if (qty > p.quantity) {
@@ -72,7 +239,6 @@ function buildPositionsFromTrades_(spreadsheet) {
       const avgCost = p.quantity > 0 ? p.cost / p.quantity : 0;
       p.quantity -= qty;
       p.cost -= avgCost * qty;
-      p.cost -= (fee + tax); // reduce remaining cost by sell expenses
     }
   }
 
@@ -174,7 +340,7 @@ function fillTradesNameFromSymbol_(spreadsheet, symbolInfoMap) {
   let updated = false;
 
   for (let i = 0; i < rows.length; i++) {
-    const symbol = rows[i][iSymbol];
+    const symbol = normalizeSymbol_(rows[i][iSymbol]);
     const name   = rows[i][iName];
 
     // Only fill when Name is empty

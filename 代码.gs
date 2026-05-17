@@ -13,6 +13,7 @@ function onOpen() {
 function runDailyPortfolioUpdate() {
   const doc = getSpreadsheet_();
   ensurePerformanceSheets_(doc);
+  fillTradeDerivedFields_(doc);
   fillPositionsFromTrades_(doc);
   const symbolInfoMap = updatePositionsPrices_(doc);
   fillTradesNameFromSymbol_(doc, symbolInfoMap);
