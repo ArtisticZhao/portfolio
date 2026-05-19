@@ -172,45 +172,38 @@ function fillTradeDerivedFields_(spreadsheet) {
   return knownNames;
 }
 
-/**
- * Build positions from Trades sheet using weighted average cost.
- * BUY increases quantity and cost.
- * SELL reduces quantity and cost at average cost.
- * @param {Spreadsheet} spreadsheet
- * @return {Object} Map: symbol -> { quantity, cost }
- */
-function buildPositionsFromTrades_(spreadsheet) {
-  const tradesSheet = spreadsheet.getSheetByName("Trades");
-  if (!tradesSheet) {
-    throw new Error('Sheet "Trades" not found');
-  }
-
-  const values = tradesSheet.getDataRange().getValues();
-  if (values.length < 2) return {};
-
-  const header = values[0];
-  const rows = values.slice(1);
-
+function calculatePositionsFromTradeRows_(header, rows) {
   const col = (name) => {
     const idx = header.indexOf(name);
     if (idx === -1) throw new Error(`Missing column in Trades: ${name}`);
     return idx;
   };
 
+  const iDate   = col("Date");
+  const iName   = header.includes("Name") ? col("Name") : -1;
   const iSymbol = col("Symbol");
   const iSide   = col("Side");
   const iQty    = col("Quantity");
   const iPrice  = col("Price");
+  const iCurrency  = header.includes("Currency") ? col("Currency") : -1;
   const iFee       = header.includes("Fee") ? col("Fee") : -1;
   const iTax       = header.includes("Tax") ? col("Tax") : -1;
   const iOtherCost = header.includes("OtherCost") ? col("OtherCost") : -1;
 
   const positions = {};
 
-  for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
-    const r = rows[rowIdx];
+  const sortedRows = rows
+    .map((row, idx) => ({ row, idx }))
+    .filter(item => normalizeSymbol_(item.row[iSymbol]))
+    .sort((a, b) => {
+      const aMs = a.row[iDate] ? dateOnlyMs_(a.row[iDate]) : 0;
+      const bMs = b.row[iDate] ? dateOnlyMs_(b.row[iDate]) : 0;
+      return aMs === bMs ? a.idx - b.idx : aMs - bMs;
+    });
+
+  sortedRows.forEach(item => {
+    const r = item.row;
     const symbol = normalizeSymbol_(r[iSymbol]);
-    if (!symbol) continue;
 
     const side  = String(r[iSide]).trim().toUpperCase();
     const qty   = Number(r[iQty]) || 0;
@@ -220,10 +213,21 @@ function buildPositionsFromTrades_(spreadsheet) {
     const otherCost = iOtherCost >= 0 ? (Number(r[iOtherCost]) || 0) : 0;
 
     if (!positions[symbol]) {
-      positions[symbol] = { quantity: 0, cost: 0 };
+      positions[symbol] = {
+        name: "",
+        market: inferMarketFromSymbol_(symbol),
+        currency: inferCurrencyFromSymbol_(symbol),
+        quantity: 0,
+        cost: 0,
+        realizedPnL: 0
+      };
     }
 
     const p = positions[symbol];
+    if (iName >= 0 && r[iName]) p.name = r[iName];
+    if (iCurrency >= 0 && r[iCurrency]) {
+      p.currency = String(r[iCurrency]).trim().toUpperCase();
+    }
 
     if (side === "BUY") {
       p.quantity += qty;
@@ -237,12 +241,39 @@ function buildPositionsFromTrades_(spreadsheet) {
       }
 
       const avgCost = p.quantity > 0 ? p.cost / p.quantity : 0;
+      const releasedCost = avgCost * qty;
+      const proceeds = qty * price - fee - tax - otherCost;
+      p.realizedPnL += proceeds - releasedCost;
       p.quantity -= qty;
-      p.cost -= avgCost * qty;
+      p.cost -= releasedCost;
+
+      if (Math.abs(p.quantity) < 1e-9) {
+        p.quantity = 0;
+        p.cost = 0;
+      }
     }
-  }
+  });
 
   return positions;
+}
+
+/**
+ * Build positions from Trades sheet using weighted average cost.
+ * BUY increases quantity and cost. SELL releases average cost and
+ * records realized PnL.
+ * @param {Spreadsheet} spreadsheet
+ * @return {Object} Map: symbol -> position
+ */
+function buildPositionsFromTrades_(spreadsheet) {
+  const tradesSheet = spreadsheet.getSheetByName("Trades");
+  if (!tradesSheet) {
+    throw new Error('Sheet "Trades" not found');
+  }
+
+  const values = tradesSheet.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  return calculatePositionsFromTradeRows_(values[0], values.slice(1));
 }
 
 
@@ -259,9 +290,7 @@ function fillPositionsFromTrades_(spreadsheet) {
   }
 
   const positions = buildPositionsFromTrades_(spreadsheet);
-  const symbols = Object.keys(positions).filter(
-    s => positions[s].quantity > 0
-  );
+  const symbols = Object.keys(positions).sort();
 
   // Clear existing data but keep header row
   const lastRow = sheet.getLastRow();
@@ -272,19 +301,21 @@ function fillPositionsFromTrades_(spreadsheet) {
   }
 
   if (symbols.length === 0) {
-    Logger.log("No open positions.");
+    Logger.log("No trade-derived positions.");
     return;
   }
 
   const rows = symbols.map(symbol => {
     const p = positions[symbol];
     const avgCost = p.quantity > 0 ? p.cost / p.quantity : 0;
+    const status = p.quantity > 0 ? "OPEN" : "CLOSED";
 
     return [
       "",          // Market
-      "",          // Name
+      p.name || "",// Name
       symbol,      // Symbol
       "",          // Currency
+      status,      // Status
       p.quantity,  // PositionQty
       avgCost,     // AvgCost
       p.cost,      // TotalCost
@@ -292,6 +323,9 @@ function fillPositionsFromTrades_(spreadsheet) {
       "",          // MarketValue (formula)
       "",          // UnrealizedPnL (formula)
       "",          // UnrealizedPnL% (formula)
+      p.realizedPnL,// RealizedPnL
+      "",          // TotalPnL (formula)
+      "",          // TotalPnL% (formula)
       ""           // Weight (formula)
     ];
   });

@@ -17,6 +17,8 @@ function updatePositionsPrices_(spreadsheet) {
   const iMarket = col("Market");
   const iName = col("Name");
   const iSymbol = col("Symbol");
+  const iStatus = col("Status");
+  const iQty = col("PositionQty");
   const iLastPrice = col("LastPrice");
 
   const cnAssets = [];
@@ -25,7 +27,10 @@ function updatePositionsPrices_(spreadsheet) {
   for (let i = 1; i < data.length; i++) {
     const symbol = data[i][iSymbol];
     const market = data[i][iMarket];
+    const status = iStatus >= 0 ? String(data[i][iStatus] || "").trim().toUpperCase() : "OPEN";
+    const qty = iQty >= 0 ? (Number(data[i][iQty]) || 0) : 0;
     if (!symbol || !market) continue;
+    if (status === "CLOSED" || qty <= 0) continue;
 
     if (market === "CN") {
       cnAssets.push({ symbol: symbol, row: i + 1 });

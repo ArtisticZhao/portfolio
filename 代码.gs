@@ -17,5 +17,6 @@ function runDailyPortfolioUpdate() {
   fillPositionsFromTrades_(doc);
   const symbolInfoMap = updatePositionsPrices_(doc);
   fillTradesNameFromSymbol_(doc, symbolInfoMap);
+  rebuildCashLedgerFromTrades_(doc);
   appendDailyNavSnapshot_(doc);
 }

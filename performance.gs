@@ -1,36 +1,24 @@
 /**
  * Ensure performance-related sheets exist with expected headers.
  * Sheets:
- * - CashFlow: manual external deposit/withdraw records
- * - CashBalance: computed cash retained inside investment accounts
+ * - CashLedger: generated cash ledger from Trades
  * - NAV_Daily: daily account snapshot in CNY
  * - PnL_View: dashboard formulas
- *
- * CashFlow sign rule:
- * - Positive amount = cash into investment account (deposit)
- * - Negative amount = cash out of investment account (withdraw)
  */
 function ensurePerformanceSheets_(spreadsheet) {
-  ensureSheetWithHeader_(spreadsheet, "CashFlow", [
+  ensureSheetWithHeader_(spreadsheet, "CashLedger", [
     "Date",
-    "Type",
-    "Amount",
-    "Currency",
-    "Note",
-    "AmountCNY"
-  ]);
-
-  ensureSheetWithHeader_(spreadsheet, "CashBalance", [
-    "Date",
+    "TradeCashFlowCNY",
+    "AutoDepositCNY",
     "CashBalanceCNY",
-    "Currency",
     "Note"
   ]);
 
   ensureSheetWithHeader_(spreadsheet, "NAV_Daily", [
     "Date",
     "EquityValueCNY",
-    "NetFlowCNY",
+    "CashBalanceCNY",
+    "AutoDepositCNY",
     "TotalAssetCNY",
     "PrevTotalAssetCNY",
     "TradingPnL",
@@ -43,7 +31,6 @@ function ensurePerformanceSheets_(spreadsheet) {
     "Notes"
   ]);
 
-  setupCashFlowFormula_(spreadsheet);
   setupPnLViewFormula_(spreadsheet);
 }
 
@@ -67,18 +54,6 @@ function ensureSheetWithHeader_(spreadsheet, name, headers) {
   }
 }
 
-function setupCashFlowFormula_(spreadsheet) {
-  const sheet = spreadsheet.getSheetByName("CashFlow");
-  if (!sheet) return;
-
-  // AmountCNY = Amount * FX(Currency->CNY)
-  const formula = [
-    '=ARRAYFORMULA(IF(A2:A="",,IF(C2:C="",,C2:C*IF(D2:D="CNY",1,IF(D2:D="USD",IFERROR(GOOGLEFINANCE("CURRENCY:USDCNY"),),IF(D2:D="HKD",IFERROR(GOOGLEFINANCE("CURRENCY:HKDCNY"),),))))))'
-  ];
-
-  sheet.getRange("F2").setFormula(formula[0]);
-}
-
 /**
  * Capture one daily snapshot into NAV_Daily.
  * Snapshot date is today in spreadsheet timezone.
@@ -99,8 +74,8 @@ function appendDailyNavSnapshot_(spreadsheet) {
   const todayKey = formatDateKey_(today);
 
   const equityValueCNY = computeEquityValueCNY_(spreadsheet);
-  const netFlowCNY = getNetFlowCNYForDate_(spreadsheet, today);
-  const cashBalanceCNY = updateCashBalanceForDate_(spreadsheet, today);
+  const cashBalanceCNY = getCashBalanceCNYForDate_(spreadsheet, today);
+  const autoDepositCNY = getAutoDepositCNYForDate_(spreadsheet, today);
   const totalAssetCNY = equityValueCNY + cashBalanceCNY;
 
   // Upsert by date to avoid duplicate rows when running repeatedly on same day.
@@ -121,25 +96,164 @@ function appendDailyNavSnapshot_(spreadsheet) {
     targetRow = navSheet.getLastRow() + 1;
   }
 
-  navSheet.getRange(targetRow, 1, 1, 4).setValues([[
+  navSheet.getRange(targetRow, 1, 1, 5).setValues([[
     today,
     equityValueCNY,
-    netFlowCNY,
+    cashBalanceCNY,
+    autoDepositCNY,
     totalAssetCNY
   ]]);
 
-  // Fill derived columns E:F:G.
-  navSheet.getRange(targetRow, 5).setFormula(
-    `=IFERROR(INDEX(D$2:D,ROW()-2),)`
-  );
+  // Fill derived columns F:G:H.
   navSheet.getRange(targetRow, 6).setFormula(
-    `=IF(E${targetRow}="",,D${targetRow}-E${targetRow}-C${targetRow})`
+    `=IF(A${targetRow}="",,IF(ROW()=2,,INDEX(E$2:E,ROW()-2)))`
   );
   navSheet.getRange(targetRow, 7).setFormula(
-    `=IF(E${targetRow}="",,IF(E${targetRow}=0,,F${targetRow}/E${targetRow}))`
+    `=IF(A${targetRow}="",,IF(F${targetRow}="",,E${targetRow}-F${targetRow}-D${targetRow}))`
+  );
+  navSheet.getRange(targetRow, 8).setFormula(
+    `=IF(A${targetRow}="",,IF(F${targetRow}="",,IF(F${targetRow}+D${targetRow}=0,,G${targetRow}/(F${targetRow}+D${targetRow}))))`
   );
 
   Logger.log(`NAV snapshot updated for ${todayKey}`);
+}
+
+function rebuildCashLedgerFromTrades_(spreadsheet) {
+  const sheet = spreadsheet.getSheetByName("CashLedger");
+  if (!sheet) throw new Error('Sheet "CashLedger" not found');
+
+  const dailyFlows = getDailyTradeCashFlowsCNY_(spreadsheet);
+  const keys = Object.keys(dailyFlows).sort();
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
+  }
+
+  if (keys.length === 0) return;
+
+  const rows = calculateCashLedgerRowsFromDailyFlows_(dailyFlows);
+
+  sheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function calculateCashLedgerRowsFromDailyFlows_(dailyFlows) {
+  let cash = 0;
+  return Object.keys(dailyFlows).sort().map(key => {
+    const tradeCashFlow = roundMoney_(dailyFlows[key].tradeCashFlowCNY);
+    cash = roundMoney_(cash + tradeCashFlow);
+    const autoDeposit = cash < 0 ? roundMoney_(-cash) : 0;
+    cash = roundMoney_(cash + autoDeposit);
+    return [
+      dailyFlows[key].date,
+      tradeCashFlow,
+      autoDeposit,
+      cash,
+      autoDeposit > 0 ? "Auto deposit to keep cash non-negative" : "Trade cash flow"
+    ];
+  });
+}
+
+function getDailyTradeCashFlowsCNY_(spreadsheet) {
+  const sheet = spreadsheet.getSheetByName("Trades");
+  if (!sheet) return {};
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const header = values[0];
+  const col = name => header.indexOf(name);
+  const iDate = col("Date");
+  const iSide = col("Side");
+  const iQty = col("Quantity");
+  const iPrice = col("Price");
+  const iCurrency = col("Currency");
+  const iFee = col("Fee");
+  const iTax = col("Tax");
+  const iOtherCost = col("OtherCost");
+
+  if ([iDate, iSide, iQty, iPrice, iCurrency].some(i => i < 0)) {
+    throw new Error("Trades sheet must contain Date, Side, Quantity, Price, and Currency columns");
+  }
+
+  const fxMap = getFxToCnyMap_(spreadsheet);
+  const daily = {};
+
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    if (!row[iDate]) continue;
+
+    const side = String(row[iSide] || "").trim().toUpperCase();
+    const gross = (Number(row[iQty]) || 0) * (Number(row[iPrice]) || 0);
+    if (!side || gross <= 0) continue;
+
+    const fee = iFee >= 0 ? (Number(row[iFee]) || 0) : 0;
+    const tax = iTax >= 0 ? (Number(row[iTax]) || 0) : 0;
+    const otherCost = iOtherCost >= 0 ? (Number(row[iOtherCost]) || 0) : 0;
+    const currency = String(row[iCurrency] || "CNY").trim().toUpperCase();
+    const fx = fxMap[currency] || 1;
+    const key = formatDateKey_(row[iDate]);
+
+    if (!daily[key]) {
+      daily[key] = { date: new Date(dateOnlyMs_(row[iDate])), tradeCashFlowCNY: 0 };
+    }
+
+    if (side === "BUY") {
+      daily[key].tradeCashFlowCNY -= (gross + fee + tax + otherCost) * fx;
+    } else if (side === "SELL") {
+      daily[key].tradeCashFlowCNY += (gross - fee - tax - otherCost) * fx;
+    }
+  }
+
+  return daily;
+}
+
+function getCashLedgerRows_(spreadsheet) {
+  const sheet = spreadsheet.getSheetByName("CashLedger");
+  if (!sheet) return [];
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+
+  const header = values[0];
+  const col = name => header.indexOf(name);
+  const iDate = col("Date");
+  const iAutoDeposit = col("AutoDepositCNY");
+  const iBalance = col("CashBalanceCNY");
+  if ([iDate, iAutoDeposit, iBalance].some(i => i < 0)) {
+    throw new Error("CashLedger sheet must contain Date, AutoDepositCNY, and CashBalanceCNY columns");
+  }
+
+  return values.slice(1)
+    .filter(row => row[iDate])
+    .map(row => ({
+      date: row[iDate],
+      autoDeposit: Number(row[iAutoDeposit]) || 0,
+      balance: Number(row[iBalance]) || 0
+    }));
+}
+
+function getCashBalanceCNYForDate_(spreadsheet, dateObj) {
+  const targetMs = dateOnlyMs_(dateObj);
+  let bestMs = -Infinity;
+  let balance = 0;
+
+  getCashLedgerRows_(spreadsheet).forEach(row => {
+    const ms = dateOnlyMs_(row.date);
+    if (ms <= targetMs && ms > bestMs) {
+      bestMs = ms;
+      balance = row.balance;
+    }
+  });
+
+  return balance;
+}
+
+function getAutoDepositCNYForDate_(spreadsheet, dateObj) {
+  const target = formatDateKey_(dateObj);
+  return getCashLedgerRows_(spreadsheet).reduce((sum, row) => {
+    return formatDateKey_(row.date) === target ? sum + row.autoDeposit : sum;
+  }, 0);
 }
 
 function updateCashBalanceForDate_(spreadsheet, dateObj) {
@@ -434,15 +548,14 @@ function setupPnLViewFormula_(spreadsheet) {
   }
 
   const rows = [
-    ["Latest Trading Date", '=IFERROR(LOOKUP(2,1/(NAV_Daily!A2:A<>""),NAV_Daily!A2:A),"")', "NAV_Daily latest date"],
-    ["Total Asset (CNY)", '=IFERROR(LOOKUP(2,1/(NAV_Daily!D2:D<>""),NAV_Daily!D2:D),0)', "Latest total asset"],
-    ["Today PnL", '=IFERROR(LOOKUP(2,1/(NAV_Daily!F2:F<>""),NAV_Daily!F2:F),0)', "Trading-day PnL"],
-    ["Today Return", '=IFERROR(LOOKUP(2,1/(NAV_Daily!G2:G<>""),NAV_Daily!G2:G),0)', "Trading-day return"],
-    ["MTD PnL", '=IFERROR(SUM(FILTER(NAV_Daily!F2:F,NAV_Daily!A2:A>=EOMONTH(TODAY(),-1)+1,NAV_Daily!A2:A<=TODAY())),0)', "Month-to-date"],
-    ["YTD PnL", '=IFERROR(SUM(FILTER(NAV_Daily!F2:F,NAV_Daily!A2:A>=DATE(YEAR(TODAY()),1,1),NAV_Daily!A2:A<=TODAY())),0)', "Year-to-date"],
-    ["Since Inception XIRR", '=IFERROR(XIRR({FILTER(CashFlow!F2:F,CashFlow!A2:A<>"",CashFlow!F2:F<>0);-LOOKUP(2,1/(NAV_Daily!D2:D<>""),NAV_Daily!D2:D)},{FILTER(CashFlow!A2:A,CashFlow!A2:A<>"",CashFlow!F2:F<>0);LOOKUP(2,1/(NAV_Daily!A2:A<>""),NAV_Daily!A2:A)}),"")', "Money-weighted return"],
-    ["MTD XIRR", '=IFERROR(XIRR({FILTER(CashFlow!F2:F,CashFlow!A2:A>=EOMONTH(TODAY(),-1)+1,CashFlow!A2:A<=TODAY(),CashFlow!F2:F<>0);-XLOOKUP(MAX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<=TODAY(),NAV_Daily!D2:D<>"")),NAV_Daily!A2:A,NAV_Daily!D2:D)},{FILTER(CashFlow!A2:A,CashFlow!A2:A>=EOMONTH(TODAY(),-1)+1,CashFlow!A2:A<=TODAY(),CashFlow!F2:F<>0);XLOOKUP(MAX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<=TODAY(),NAV_Daily!D2:D<>"")),NAV_Daily!A2:A,NAV_Daily!A2:A)}),"")', "Money-weighted monthly"],
-    ["YTD XIRR", '=IFERROR(XIRR({FILTER(CashFlow!F2:F,CashFlow!A2:A>=DATE(YEAR(TODAY()),1,1),CashFlow!A2:A<=TODAY(),CashFlow!F2:F<>0);-XLOOKUP(MAX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<=TODAY(),NAV_Daily!D2:D<>"")),NAV_Daily!A2:A,NAV_Daily!D2:D)},{FILTER(CashFlow!A2:A,CashFlow!A2:A>=DATE(YEAR(TODAY()),1,1),CashFlow!A2:A<=TODAY(),CashFlow!F2:F<>0);XLOOKUP(MAX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<=TODAY(),NAV_Daily!D2:D<>"")),NAV_Daily!A2:A,NAV_Daily!A2:A)}),"")', "Money-weighted yearly"]
+    ["Latest Trading Date", '=IFERROR(INDEX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>""))),"")', "NAV_Daily latest date"],
+    ["Total Asset (CNY)", '=IFERROR(INDEX(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>""))),0)', "Latest equity plus cash"],
+    ["Cash Balance (CNY)", '=IFERROR(INDEX(FILTER(NAV_Daily!C2:C,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!C2:C,NAV_Daily!A2:A<>""))),0)', "Latest generated cash balance"],
+    ["Today PnL", '=IFERROR(INDEX(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A<>""))),0)', "Trading PnL after deposits"],
+    ["Today Return", '=IFERROR(INDEX(FILTER(NAV_Daily!H2:H,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!H2:H,NAV_Daily!A2:A<>""))),0)', "Trading return after deposits"],
+    ["MTD PnL", '=IFERROR(SUM(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A>=EOMONTH(TODAY(),-1)+1,NAV_Daily!A2:A<=TODAY())),0)', "Month-to-date trading PnL"],
+    ["YTD PnL", '=IFERROR(SUM(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A>=DATE(YEAR(TODAY()),1,1),NAV_Daily!A2:A<=TODAY())),0)', "Year-to-date trading PnL"],
+    ["Optional Since Inception XIRR", '=IFERROR(XIRR({FILTER(CashLedger!C2:C,CashLedger!A2:A<>"",CashLedger!C2:C>0);-INDEX(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>"")))},{FILTER(CashLedger!A2:A,CashLedger!A2:A<>"",CashLedger!C2:C>0);INDEX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>"")))}),"")', "Optional money-weighted reference"]
   ];
 
   sheet.getRange(2, 1, rows.length, 3).setValues(rows);
