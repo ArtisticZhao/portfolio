@@ -200,7 +200,7 @@ function getDailyTradeCashFlowsCNY_(spreadsheet) {
 
     if (side === "BUY") {
       daily[key].tradeCashFlowCNY -= (gross + fee + tax + otherCost) * fx;
-    } else if (side === "SELL") {
+    } else if (side === "SELL" || side === "DIVIDEND") {
       daily[key].tradeCashFlowCNY += (gross - fee - tax - otherCost) * fx;
     }
   }
@@ -406,7 +406,7 @@ function getTradeCashFlowCNYBetweenDates_(spreadsheet, startDateExclusive, endDa
 
     if (side === "BUY") {
       sum -= (gross + fee + tax + otherCost) * fx;
-    } else if (side === "SELL") {
+    } else if (side === "SELL" || side === "DIVIDEND") {
       sum += (gross - fee - tax - otherCost) * fx;
     }
   }

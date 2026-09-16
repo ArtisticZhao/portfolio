@@ -50,6 +50,8 @@ function roundMoney_(value) {
 function calculateTradeCosts_(symbol, side, quantity, price) {
   const market = inferMarketFromSymbol_(symbol);
   const normalizedSide = String(side || "").trim().toUpperCase();
+  // Cash dividends use actual withholding tax and fees entered by the user.
+  if (normalizedSide === "DIVIDEND") return { fee: 0, tax: 0, otherCost: 0 };
   const gross = (Number(quantity) || 0) * (Number(price) || 0);
   if (!market || gross <= 0) return { fee: 0, tax: 0, otherCost: 0 };
 
@@ -236,7 +238,7 @@ function calculatePositionsFromTradeRows_(header, rows) {
     } else if (side === "SELL") {
       if (qty > p.quantity) {
         throw new Error(
-          `Sell quantity exceeds position for ${symbol} at row ${rowIdx + 2}`
+          `Sell quantity exceeds position for ${symbol} at row ${item.idx + 2}`
         );
       }
 
@@ -251,6 +253,10 @@ function calculatePositionsFromTradeRows_(header, rows) {
         p.quantity = 0;
         p.cost = 0;
       }
+    } else if (side === "DIVIDEND") {
+      // Quantity is the eligible share count; Price is the gross dividend/share.
+      // Payment may arrive after a sale. Do not alter shares or acquisition cost.
+      p.realizedPnL += qty * price - fee - tax - otherCost;
     }
   });
 
@@ -260,7 +266,7 @@ function calculatePositionsFromTradeRows_(header, rows) {
 /**
  * Build positions from Trades sheet using weighted average cost.
  * BUY increases quantity and cost. SELL releases average cost and
- * records realized PnL.
+ * records realized PnL. DIVIDEND adds net cash income to realized PnL only.
  * @param {Spreadsheet} spreadsheet
  * @return {Object} Map: symbol -> position
  */
