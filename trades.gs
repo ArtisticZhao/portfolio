@@ -167,6 +167,9 @@ function fillTradeDerivedFields_(spreadsheet) {
   });
 
   if (updated) {
+    // Same text-coercion guard as Positions: rewriting the full range
+    // must not let Sheets turn a symbol like "002317" into 2317.
+    sheet.getRange(2, iSymbol + 1, rows.length, 1).setNumberFormat("@");
     range.setValues([header].concat(rows));
     Logger.log("Trades derived fields updated.");
   }
@@ -310,6 +313,10 @@ function fillPositionsFromTrades_(spreadsheet) {
     Logger.log("No trade-derived positions.");
     return;
   }
+
+  // Symbol column must stay plain text, otherwise Sheets auto-coerces
+  // strings like "002317" into the number 2317 and drops leading zeros.
+  sheet.getRange(3, 3, symbols.length, 1).setNumberFormat("@");
 
   const rows = symbols.map(symbol => {
     const p = positions[symbol];
