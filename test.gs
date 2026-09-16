@@ -62,18 +62,23 @@ function testBuildPositionsFromTradesWeightedCost_() {
   assertAlmostEqual_(positions.BBB.realizedPnL, 19, "BBB realized PnL");
 }
 
-function testCashLedgerAutoDeposit_() {
-  const dailyFlows = {
-    "2026-01-01": { date: new Date("2026-01-01"), tradeCashFlowCNY: -100 },
-    "2026-01-02": { date: new Date("2026-01-02"), tradeCashFlowCNY: 40 },
-    "2026-01-03": { date: new Date("2026-01-03"), tradeCashFlowCNY: -60 }
+/**
+ * No more AutoDeposit floor: cash balance is a plain running sum of trade
+ * + external flows, and is allowed to go negative (a real signal, not
+ * something to paper over with a synthetic deposit).
+ */
+function testWalkCashBalancesNoAutoDeposit_() {
+  const tradeFlows = {
+    "2026-01-01": -100,
+    "2026-01-02": 40,
+    "2026-01-03": -60
+  };
+  const externalFlows = {
+    "2026-01-01": 50
   };
 
-  const rows = calculateCashLedgerRowsFromDailyFlows_(dailyFlows);
-  assertAlmostEqual_(rows[0][2], 100, "day 1 auto deposit");
-  assertAlmostEqual_(rows[0][3], 0, "day 1 cash balance");
-  assertAlmostEqual_(rows[1][2], 0, "day 2 auto deposit");
-  assertAlmostEqual_(rows[1][3], 40, "day 2 cash balance");
-  assertAlmostEqual_(rows[2][2], 20, "day 3 auto deposit");
-  assertAlmostEqual_(rows[2][3], 0, "day 3 cash balance");
+  const rows = walkCashBalances_(tradeFlows, externalFlows);
+  assertAlmostEqual_(rows[0].cashBalance, -50, "day 1 balance (no auto deposit, negative allowed)");
+  assertAlmostEqual_(rows[1].cashBalance, -10, "day 2 balance");
+  assertAlmostEqual_(rows[2].cashBalance, -70, "day 3 balance");
 }

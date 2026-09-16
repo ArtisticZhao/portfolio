@@ -89,6 +89,63 @@ function fetchFromGoogle_(assets) {
 }
 
 /**
+ * Fetch historical daily close prices for a batch of symbols in one shot,
+ * using GOOGLEFINANCE's date-range query. One temp spreadsheet, one wait,
+ * one read for the whole batch (unlike fetchFromGoogle_'s live-price calls,
+ * this returns a Date/Close table per symbol that needs to spill, so each
+ * symbol gets its own 2-column slot).
+ *
+ * @param {Array<Object>} assets [{ symbol, googleSymbol? }] googleSymbol
+ *   overrides what's passed to GOOGLEFINANCE (e.g. "CURRENCY:USDCNY"),
+ *   while the returned map is still keyed by `symbol`.
+ * @param {string} startDateKey "yyyy-MM-dd"
+ * @param {string} endDateKey "yyyy-MM-dd"
+ * @return {Object} symbol -> { "yyyy-MM-dd": close }
+ */
+function fetchGoogleFinanceHistoryBatch_(assets, startDateKey, endDateKey) {
+  const result = {};
+  if (!assets || assets.length === 0) return result;
+
+  const start = new Date(startDateKey + "T00:00:00");
+  const end = new Date(endDateKey + "T00:00:00");
+  const startExpr = `DATE(${start.getFullYear()},${start.getMonth() + 1},${start.getDate()})`;
+  const endExpr = `DATE(${end.getFullYear()},${end.getMonth() + 1},${end.getDate()})`;
+
+  const tempSs = SpreadsheetApp.create("TempGoogleFinanceHistoryFetcher");
+  const tempSheet = tempSs.getSheets()[0];
+
+  try {
+    assets.forEach((a, index) => {
+      const col = index * 2 + 1;
+      const sym = a.googleSymbol || a.symbol;
+      tempSheet
+        .getRange(1, col)
+        .setFormula(`=IFERROR(GOOGLEFINANCE("${sym}","close",${startExpr},${endExpr}),"")`);
+    });
+
+    Utilities.sleep(10000);
+
+    assets.forEach((a, index) => {
+      const col = index * 2 + 1;
+      const rows = tempSheet.getRange(1, col, 3000, 2).getValues();
+      const map = {};
+      rows.forEach(r => {
+        if (!(r[0] instanceof Date)) return;
+        const close = Number(r[1]);
+        if (!isNaN(close) && close > 0) {
+          map[formatDateKey_(r[0])] = close;
+        }
+      });
+      result[a.symbol] = map;
+    });
+  } finally {
+    DriveApp.getFileById(tempSs.getId()).setTrashed(true);
+  }
+
+  return result;
+}
+
+/**
  * Fetch latest prices and names for A-shares from Sina.
  * @param {Array<Object>} assets [{ symbol }]
  * @return {Object} symbol -> { name, price }
