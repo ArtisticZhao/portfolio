@@ -167,9 +167,13 @@ function fillTradeDerivedFields_(spreadsheet) {
   });
 
   if (updated) {
-    // Same text-coercion guard as Positions: rewriting the full range
-    // must not let Sheets turn a symbol like "002317" into 2317.
-    sheet.getRange(2, iSymbol + 1, rows.length, 1).setNumberFormat("@");
+    // Keep symbols like "002317" as text. Skip if the column is a typed
+    // Table column (format is fixed there and setNumberFormat throws).
+    try {
+      sheet.getRange(2, iSymbol + 1, rows.length, 1).setNumberFormat("@");
+    } catch (e) {
+      Logger.log("Skip Trades Symbol number format: " + e.message);
+    }
     range.setValues([header].concat(rows));
     Logger.log("Trades derived fields updated.");
   }
@@ -314,10 +318,8 @@ function fillPositionsFromTrades_(spreadsheet) {
     return;
   }
 
-  // Symbol column must stay plain text, otherwise Sheets auto-coerces
-  // strings like "002317" into the number 2317 and drops leading zeros.
-  sheet.getRange(3, 3, symbols.length, 1).setNumberFormat("@");
-
+  // Positions Symbol column is a Table column fixed to plain text, so no
+  // setNumberFormat here (it throws on typed Table columns).
   const rows = symbols.map(symbol => {
     const p = positions[symbol];
     const avgCost = p.quantity > 0 ? p.cost / p.quantity : 0;
