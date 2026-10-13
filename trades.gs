@@ -167,13 +167,8 @@ function fillTradeDerivedFields_(spreadsheet) {
   });
 
   if (updated) {
-    // Keep symbols like "002317" as text. Skip if the column is a typed
-    // Table column (format is fixed there and setNumberFormat throws).
-    try {
-      sheet.getRange(2, iSymbol + 1, rows.length, 1).setNumberFormat("@");
-    } catch (e) {
-      Logger.log("Skip Trades Symbol number format: " + e.message);
-    }
+    // Trades is a Table with typed columns; Symbol must be set to plain text
+    // there. Calling setNumberFormat on a typed Table column throws.
     range.setValues([header].concat(rows));
     Logger.log("Trades derived fields updated.");
   }
