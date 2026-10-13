@@ -1,10 +1,20 @@
+const NAV_COLUMN_COUNT_ = 10;
+const NAV_QUALITY_LIVE_ = "LIVE";
+const NAV_QUALITY_PENDING_ = "PENDING";
+const PRICE_NO_DATA_SOURCE_ = "NO_DATA";
+// A weekday without a close is only recorded as a market holiday once it is
+// this many days old; before that the close may simply not be published yet.
+const PRICE_SETTLE_DAYS_ = 3;
+const HISTORY_LOOKBACK_DAYS_ = 10;
+
 /**
  * Ensure performance-related sheets exist with expected headers.
  * Sheets:
  * - CashLedger: generated cash ledger from Trades + CashFlow (external flows)
- * - NAV_Daily: daily account snapshot in CNY
+ * - NAV_Daily: daily account snapshot in CNY; InputSig records which
+ *   Trades/CashFlow rows each row was computed from (see syncCashAndNavHistory_)
  * - PnL_View: dashboard formulas
- * - FxHistory / PriceHistory: cache sheets for historical rebuilds
+ * - FxHistory / PriceHistory: cache sheets for historical closes
  */
 function ensurePerformanceSheets_(spreadsheet) {
   ensureSheetWithHeader_(spreadsheet, "CashLedger", [
@@ -24,7 +34,8 @@ function ensurePerformanceSheets_(spreadsheet) {
     "PrevTotalAssetCNY",
     "TradingPnL",
     "DailyReturn",
-    "DataQuality"
+    "DataQuality",
+    "InputSig"
   ]);
 
   ensureSheetWithHeader_(spreadsheet, "PnL_View", [
@@ -81,129 +92,6 @@ function ensureSheetWithHeader_(spreadsheet, name, headers, hidden) {
 }
 
 /**
- * Capture one daily snapshot into NAV_Daily. Append-only: only ever
- * touches "today"'s row, historical rows are never rewritten here.
- * Snapshot date is today in spreadsheet timezone.
- * @param {Spreadsheet} spreadsheet
- * @param {Object} fxMap CNY->1, USD->rate, HKD->rate (see getFxToCnyMap_)
- */
-function appendDailyNavSnapshot_(spreadsheet, fxMap) {
-  const navSheet = spreadsheet.getSheetByName("NAV_Daily");
-  const posSheet = spreadsheet.getSheetByName("Positions");
-  if (!navSheet || !posSheet) {
-    throw new Error('Missing sheet: "NAV_Daily" or "Positions"');
-  }
-
-  if (!isWeekdayTradingDay_(spreadsheet)) {
-    Logger.log("Today is weekend, skip NAV snapshot for trading-day view.");
-    return;
-  }
-
-  const today = getTodayDateOnly_(spreadsheet);
-  const todayKey = formatDateKey_(today);
-
-  const equityValueCNY = computeEquityValueCNY_(spreadsheet, fxMap);
-  const cashBalanceCNY = getCashBalanceCNYForDate_(spreadsheet, today);
-  const externalCashFlowCNY = getExternalCashFlowCNYForDate_(spreadsheet, today);
-  const totalAssetCNY = equityValueCNY + cashBalanceCNY;
-
-  // Upsert by date to avoid duplicate rows when running repeatedly on same day.
-  const lastRow = navSheet.getLastRow();
-  const rows = lastRow >= 2 ? navSheet.getRange(2, 1, lastRow - 1, 1).getValues() : [];
-
-  let targetRow = -1;
-  for (let i = 0; i < rows.length; i++) {
-    const d = rows[i][0];
-    if (!d) continue;
-    if (formatDateKey_(d) === todayKey) {
-      targetRow = i + 2;
-      break;
-    }
-  }
-
-  if (targetRow === -1) {
-    targetRow = navSheet.getLastRow() + 1;
-  }
-
-  navSheet.getRange(targetRow, 1, 1, 5).setValues([[
-    today,
-    equityValueCNY,
-    cashBalanceCNY,
-    externalCashFlowCNY,
-    totalAssetCNY
-  ]]);
-
-  // Fill derived columns F:G:H.
-  navSheet.getRange(targetRow, 6).setFormula(
-    `=IF(A${targetRow}="",,IF(ROW()=2,,INDEX(E$2:E,ROW()-2)))`
-  );
-  navSheet.getRange(targetRow, 7).setFormula(
-    `=IF(A${targetRow}="",,IF(F${targetRow}="",,E${targetRow}-F${targetRow}-D${targetRow}))`
-  );
-  navSheet.getRange(targetRow, 8).setFormula(
-    `=IF(A${targetRow}="",,IF(F${targetRow}="",,IF(F${targetRow}+D${targetRow}=0,,G${targetRow}/(F${targetRow}+D${targetRow}))))`
-  );
-  navSheet.getRange(targetRow, 9).setValue("LIVE");
-
-  Logger.log(`NAV snapshot updated for ${todayKey}`);
-}
-
-/**
- * Append/upsert only "today"'s CashLedger row from the running balance of
- * the last existing row. Historical rows are never recomputed here — use
- * rebuildCashLedgerHistory_ for a deliberate full rebuild.
- * @return {number} new cash balance after today's flows
- */
-function appendTodayCashLedgerRow_(spreadsheet, fxMap) {
-  const sheet = spreadsheet.getSheetByName("CashLedger");
-  if (!sheet) throw new Error('Sheet "CashLedger" not found');
-
-  const today = getTodayDateOnly_(spreadsheet);
-  const todayKey = formatDateKey_(today);
-  const fxLookup = currency => {
-    if (currency === "CNY") return 1;
-    if (fxMap[currency]) return fxMap[currency];
-    Logger.log(`Unknown currency "${currency}", defaulting FX to 1.`);
-    return 1;
-  };
-
-  const tradeFlows = getDailyTradeCashFlowsCNY_(spreadsheet, fxLookup);
-  const externalFlows = getDailyExternalCashFlowsCNY_(spreadsheet, fxLookup);
-
-  const tradeFlowToday = roundMoney_(tradeFlows[todayKey] || 0);
-  const externalFlowToday = roundMoney_(externalFlows[todayKey] || 0);
-
-  const lastRow = sheet.getLastRow();
-  const priorRows = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, 5).getValues() : [];
-
-  let targetRow = -1;
-  let priorBalance = 0;
-  priorRows.forEach((row, idx) => {
-    if (!row[0]) return;
-    const rowKey = formatDateKey_(row[0]);
-    if (rowKey === todayKey) {
-      targetRow = idx + 2;
-    } else if (rowKey < todayKey) {
-      priorBalance = Number(row[3]) || 0;
-    }
-  });
-
-  const newBalance = roundMoney_(priorBalance + tradeFlowToday + externalFlowToday);
-  if (targetRow === -1) targetRow = lastRow + 1;
-
-  sheet.getRange(targetRow, 1, 1, 5).setValues([[
-    today,
-    tradeFlowToday,
-    externalFlowToday,
-    newBalance,
-    "Trade + external cash flow"
-  ]]);
-
-  Logger.log(`CashLedger row upserted for ${todayKey}: balance=${newBalance}`);
-  return newBalance;
-}
-
-/**
  * Pure helper: walk-forward cumulative cash balance from per-date trade and
  * external cash flows. No AutoDeposit floor — balance is allowed to go
  * negative, which is a real signal (missing a deposit record), not
@@ -225,33 +113,27 @@ function walkCashBalances_(tradeFlowsByDate, externalFlowsByDate) {
 }
 
 /**
- * Deliberate full CashLedger rebuild using cached historical FX (not
- * "today"'s live rate applied to every past trade). Idempotent: same
- * Trades/CashFlow/FxHistory input always produces the same output.
+ * Rewrite CashLedger from walked balances. It is a pure function of
+ * Trades/CashFlow and cached historical FX, so rewriting it on every sync
+ * is reproducible (unlike the old "today's live FX on every past trade").
  */
-function rebuildCashLedgerHistory_(spreadsheet) {
+function writeCashLedger_(spreadsheet, walked) {
   const sheet = spreadsheet.getSheetByName("CashLedger");
   if (!sheet) throw new Error('Sheet "CashLedger" not found');
-
-  const fxLookup = makeHistoricalFxLookup_(loadFxHistoryMap_(spreadsheet));
-  const tradeFlows = getDailyTradeCashFlowsCNY_(spreadsheet, fxLookup);
-  const externalFlows = getDailyExternalCashFlowsCNY_(spreadsheet, fxLookup);
-
-  const walked = walkCashBalances_(tradeFlows, externalFlows);
 
   const rows = walked.map(w => [
     new Date(w.date + "T00:00:00"),
     w.tradeFlow,
     w.externalFlow,
     w.cashBalance,
-    "Rebuilt from history"
+    "Trade + external cash flow"
   ]);
 
   const lastRow = sheet.getLastRow();
   if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
   if (rows.length > 0) sheet.getRange(2, 1, rows.length, 5).setValues(rows);
 
-  Logger.log(`CashLedger history rebuilt: ${rows.length} rows.`);
+  Logger.log(`CashLedger rewritten: ${rows.length} rows.`);
 }
 
 /**
@@ -393,77 +275,9 @@ function fillCashFlowDerivedFields_(spreadsheet, fxLookup) {
   range.setValues([header].concat(rows));
 }
 
-function getCashLedgerRows_(spreadsheet) {
-  const sheet = spreadsheet.getSheetByName("CashLedger");
-  if (!sheet) return [];
-
-  const values = sheet.getDataRange().getValues();
-  if (values.length < 2) return [];
-
-  const header = values[0];
-  const col = name => header.indexOf(name);
-  const iDate = col("Date");
-  const iExternalFlow = col("ExternalCashFlowCNY");
-  const iBalance = col("CashBalanceCNY");
-  if ([iDate, iExternalFlow, iBalance].some(i => i < 0)) {
-    throw new Error("CashLedger sheet must contain Date, ExternalCashFlowCNY, and CashBalanceCNY columns");
-  }
-
-  return values.slice(1)
-    .filter(row => row[iDate])
-    .map(row => ({
-      date: row[iDate],
-      externalFlow: Number(row[iExternalFlow]) || 0,
-      balance: Number(row[iBalance]) || 0
-    }));
-}
-
-function getCashBalanceCNYForDate_(spreadsheet, dateObj) {
-  const targetMs = dateOnlyMs_(dateObj);
-  let bestMs = -Infinity;
-  let balance = 0;
-
-  getCashLedgerRows_(spreadsheet).forEach(row => {
-    const ms = dateOnlyMs_(row.date);
-    if (ms <= targetMs && ms > bestMs) {
-      bestMs = ms;
-      balance = row.balance;
-    }
-  });
-
-  return balance;
-}
-
-function getExternalCashFlowCNYForDate_(spreadsheet, dateObj) {
-  const target = formatDateKey_(dateObj);
-  return getCashLedgerRows_(spreadsheet).reduce((sum, row) => {
-    return formatDateKey_(row.date) === target ? sum + row.externalFlow : sum;
-  }, 0);
-}
-
 function dateOnlyMs_(d) {
   const date = (d instanceof Date) ? d : new Date(d);
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
-}
-
-/**
- * Reconstruct positions as of a given date by replaying Trades up to (and
- * including) that date. Reuses calculatePositionsFromTradeRows_ (trades.gs)
- * unchanged — just pre-filters the rows.
- */
-function buildPositionsAsOfDate_(spreadsheet, asOfDate) {
-  const tradesSheet = spreadsheet.getSheetByName("Trades");
-  if (!tradesSheet) throw new Error('Sheet "Trades" not found');
-
-  const values = tradesSheet.getDataRange().getValues();
-  if (values.length < 2) return {};
-
-  const header = values[0];
-  const iDate = header.indexOf("Date");
-  const asOfMs = dateOnlyMs_(asOfDate);
-
-  const rows = values.slice(1).filter(row => row[iDate] && dateOnlyMs_(row[iDate]) <= asOfMs);
-  return calculatePositionsFromTradeRows_(header, rows);
 }
 
 /**
@@ -599,7 +413,9 @@ function makeHistoricalFxLookup_(fxHistoryMap) {
 }
 
 /**
- * @return {Object} symbol -> { dateKey: closePrice }
+ * @return {Object} symbol -> { dateKey: closePrice }. A value of 0 is a
+ *   "NO_DATA" marker: that weekday was already queried and the market was
+ *   closed, so it must not be fetched again.
  */
 function loadPriceHistoryMap_(spreadsheet) {
   const map = {};
@@ -613,34 +429,47 @@ function loadPriceHistoryMap_(spreadsheet) {
   const iDate = header.indexOf("Date");
   const iSymbol = header.indexOf("Symbol");
   const iClose = header.indexOf("ClosePrice");
+  const iSource = header.indexOf("Source");
 
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
     if (!row[iDate] || !row[iSymbol]) continue;
     const symbol = normalizeSymbol_(row[iSymbol]);
+    const key = formatDateKey_(row[iDate]);
     const price = Number(row[iClose]) || 0;
-    if (price <= 0) continue;
     if (!map[symbol]) map[symbol] = {};
-    map[symbol][formatDateKey_(row[iDate])] = price;
+
+    if (price > 0) {
+      map[symbol][key] = price;
+    } else if (row[iSource] === PRICE_NO_DATA_SOURCE_ && map[symbol][key] === undefined) {
+      map[symbol][key] = 0;
+    }
   }
   return map;
 }
 
 /**
- * @return {Function} (symbol, dateKey) -> price or null, walking back to
- *   the latest cached date <= dateKey.
+ * @return {Function} (symbol, dateKey) -> { price, settled }.
+ *   price: close on dateKey, else the latest earlier close, else null.
+ *   settled: false when dateKey itself has neither a price nor a NO_DATA
+ *   marker yet, i.e. the answer may still change once the cache fills in.
  */
 function makeHistoricalPriceLookup_(priceHistoryMap) {
   const sortedKeysCache = {};
   return function(symbol, dateKey) {
     const bySymbol = priceHistoryMap[symbol];
-    if (!bySymbol) return null;
+    if (!bySymbol) return { price: null, settled: false };
+    if (bySymbol[dateKey] > 0) return { price: bySymbol[dateKey], settled: true };
+
+    const settled = bySymbol[dateKey] === 0;
     if (!sortedKeysCache[symbol]) sortedKeysCache[symbol] = Object.keys(bySymbol).sort();
     const keys = sortedKeysCache[symbol];
     for (let i = keys.length - 1; i >= 0; i--) {
-      if (keys[i] <= dateKey) return bySymbol[keys[i]];
+      if (keys[i] < dateKey && bySymbol[keys[i]] > 0) {
+        return { price: bySymbol[keys[i]], settled: settled };
+      }
     }
-    return null;
+    return { price: null, settled: settled };
   };
 }
 
@@ -656,18 +485,29 @@ function enumerateWeekdayDateKeys_(startDateKey, endDateKey) {
   return keys;
 }
 
+function addDaysToDateKey_(dateKey, days) {
+  const d = new Date(dateKey + "T00:00:00");
+  d.setDate(d.getDate() + days);
+  return formatDateKey_(d);
+}
+
 /**
- * Ensure FxHistory covers every weekday in [startDateKey, endDateKey].
- * Cheap to call repeatedly — no-ops once the range is cached.
+ * Ensure FxHistory spans [startDateKey, endDateKey]: some cached date on or
+ * before the start (lookups walk back) and one on or after the end.
+ * Individual weekdays may be missing; no-ops once the span is cached.
  */
 function ensureFxHistoryCached_(spreadsheet, startDateKey, endDateKey) {
   const sheet = spreadsheet.getSheetByName("FxHistory");
   if (!sheet) throw new Error('Sheet "FxHistory" not found');
 
   const existing = loadFxHistoryMap_(spreadsheet);
-  const weekdayKeys = enumerateWeekdayDateKeys_(startDateKey, endDateKey);
-  const isComplete = weekdayKeys.every(k => existing[k] && existing[k].USD && existing[k].HKD);
-  if (isComplete) {
+  const cachedKeys = Object.keys(existing)
+    .filter(k => existing[k].USD && existing[k].HKD)
+    .sort();
+  const isCovered = cachedKeys.length > 0 &&
+    cachedKeys[0] <= startDateKey &&
+    cachedKeys[cachedKeys.length - 1] >= endDateKey;
+  if (isCovered) {
     Logger.log("FxHistory already covers requested range.");
     return;
   }
@@ -675,7 +515,7 @@ function ensureFxHistoryCached_(spreadsheet, startDateKey, endDateKey) {
   const fetched = fetchGoogleFinanceHistoryBatch_([
     { symbol: "USD", googleSymbol: "CURRENCY:USDCNY" },
     { symbol: "HKD", googleSymbol: "CURRENCY:HKDCNY" }
-  ], startDateKey, endDateKey);
+  ], addDaysToDateKey_(startDateKey, -HISTORY_LOOKBACK_DAYS_), endDateKey);
 
   const usdMap = fetched.USD || {};
   const hkdMap = fetched.HKD || {};
@@ -698,27 +538,41 @@ function ensureFxHistoryCached_(spreadsheet, startDateKey, endDateKey) {
 }
 
 /**
- * Ensure PriceHistory covers every weekday in range for each symbol.
- * CN -> Tushare daily; HK -> Tushare hk_daily; anything left (US, or a
- * Tushare failure) -> one batched GOOGLEFINANCE historical call.
- * Only fetches what's missing; safe to call repeatedly.
+ * Ensure PriceHistory has an entry (close or NO_DATA marker) for every
+ * requested symbol/date. CN -> Tushare daily; HK -> Tushare hk_daily;
+ * anything left (US, or a Tushare failure) -> one batched GOOGLEFINANCE
+ * historical call. Only fetches what's missing; safe to call repeatedly.
+ *
+ * @param {Object} neededBySymbol symbol -> [dateKey] the symbol was held on
+ * @param {string} todayKey NO_DATA markers are only written for dates older
+ *   than PRICE_SETTLE_DAYS_, so a close that is merely not published yet is
+ *   retried on the next run instead of being recorded as a holiday.
  */
-function ensurePriceHistoryCached_(spreadsheet, symbols, startDateKey, endDateKey) {
+function ensurePriceHistoryCached_(spreadsheet, neededBySymbol, todayKey) {
   const sheet = spreadsheet.getSheetByName("PriceHistory");
   if (!sheet) throw new Error('Sheet "PriceHistory" not found');
 
   const existing = loadPriceHistoryMap_(spreadsheet);
-  const weekdayKeys = enumerateWeekdayDateKeys_(startDateKey, endDateKey);
-
-  const needsFetch = symbols.filter(symbol => {
+  const missingKeys = [];
+  const needsFetch = Object.keys(neededBySymbol).filter(symbol => {
     const already = existing[symbol] || {};
-    return !weekdayKeys.every(k => already[k] !== undefined);
+    const missing = neededBySymbol[symbol].filter(k => already[k] === undefined);
+    missing.forEach(k => missingKeys.push(k));
+    return missing.length > 0;
   });
 
   if (needsFetch.length === 0) {
-    Logger.log("PriceHistory already covers requested range for all symbols.");
+    Logger.log("PriceHistory already covers requested dates for all symbols.");
     return;
   }
+
+  missingKeys.sort();
+  // Look back a little so a symbol first needed on a market holiday still
+  // has an earlier close to fall back to.
+  const startDateKey = addDaysToDateKey_(missingKeys[0], -HISTORY_LOOKBACK_DAYS_);
+  const endDateKey = missingKeys[missingKeys.length - 1];
+  const weekdayKeys = enumerateWeekdayDateKeys_(startDateKey, endDateKey);
+  const settleCutoffKey = addDaysToDateKey_(todayKey, -PRICE_SETTLE_DAYS_);
 
   const perSymbolResult = {};
   const googleFallbackSymbols = [];
@@ -767,16 +621,24 @@ function ensurePriceHistoryCached_(spreadsheet, symbols, startDateKey, endDateKe
     const fetchedMap = perSymbolResult[symbol].map;
     const source = perSymbolResult[symbol].source;
 
+    // An empty result means the source failed, not that every day was a
+    // holiday: write nothing so the next run retries.
+    if (Object.keys(fetchedMap).length === 0) {
+      Logger.log(`No historical prices returned for ${symbol} (${startDateKey}..${endDateKey}).`);
+      return;
+    }
+
     weekdayKeys.forEach(key => {
       if (already[key] !== undefined) return;
       const price = fetchedMap[key];
+      if (!price && key > settleCutoffKey) return;
       rowsToAppend.push([
         new Date(key + "T00:00:00"),
         symbol,
         market,
         price || "",
         currency,
-        price ? source : "ESTIMATED_MISSING"
+        price ? source : PRICE_NO_DATA_SOURCE_
       ]);
     });
   });
@@ -788,189 +650,376 @@ function ensurePriceHistoryCached_(spreadsheet, symbols, startDateKey, endDateKe
   }
 }
 
-function getEarliestDataDateKey_(spreadsheet) {
-  const dates = [];
+function isWeekdayDateKey_(dateKey) {
+  const day = new Date(dateKey + "T00:00:00").getDay();
+  return day !== 0 && day !== 6;
+}
 
-  ["Trades", "CashFlow"].forEach(name => {
-    const sheet = spreadsheet.getSheetByName(name);
-    if (!sheet) return;
-    const values = sheet.getDataRange().getValues();
-    if (values.length < 2) return;
+/**
+ * NAV_Daily only has weekday rows, so anything dated on a weekend is
+ * accounted for on the following Monday.
+ */
+function toNavDateKey_(dateKey) {
+  let key = dateKey;
+  while (!isWeekdayDateKey_(key)) key = addDaysToDateKey_(key, 1);
+  return key;
+}
+
+function shortHash_(text) {
+  const bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.MD5,
+    text,
+    Utilities.Charset.UTF_8
+  );
+  return bytes.slice(0, 4).map(b => (b & 0xff).toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Fingerprint of everything the user entered for each NAV date, stored in
+ * NAV_Daily.InputSig. A NAV row whose stored signature differs from the
+ * current one was computed from different Trades/CashFlow rows (a trade was
+ * back-filled, edited, or deleted) and must be recomputed.
+ *
+ * Format: "<trade rows>+<cash flow rows>:<hash>", e.g. "2+0:a1b2c3d4".
+ * Row order within a day does not matter. Dates without any input have no
+ * entry (stored as an empty cell).
+ *
+ * @param {Array<Array>} tradeValues Trades sheet values including header
+ * @param {Array<Array>} cashFlowValues CashFlow sheet values including header
+ * @return {Object} NAV dateKey -> signature
+ */
+function buildDailyInputSignatures_(tradeValues, cashFlowValues) {
+  const byDate = {};
+  const add = (dateValue, kind, fields) => {
+    const key = toNavDateKey_(formatDateKey_(dateValue));
+    if (!byDate[key]) byDate[key] = { trades: 0, flows: 0, lines: [] };
+    byDate[key][kind]++;
+    byDate[key].lines.push(kind + "|" + formatDateKey_(dateValue) + "|" + fields.join("|"));
+  };
+  const text = v => String(v === null || v === undefined ? "" : v).trim().toUpperCase();
+  const num = v => Number(v) || 0;
+
+  if (tradeValues && tradeValues.length > 1) {
+    const header = tradeValues[0];
+    const col = name => header.indexOf(name);
+    const iDate = col("Date");
+    const iSymbol = col("Symbol");
+    const textCols = ["Symbol", "Side", "Currency"].map(col);
+    const numCols = ["Quantity", "Price", "Fee", "Tax", "OtherCost"].map(col);
+
+    tradeValues.slice(1).forEach(row => {
+      if (!row[iDate] || !normalizeSymbol_(row[iSymbol])) return;
+      add(row[iDate], "trades", textCols.map(i => i >= 0 ? text(row[i]) : "")
+        .concat(numCols.map(i => i >= 0 ? num(row[i]) : 0)));
+    });
+  }
+
+  if (cashFlowValues && cashFlowValues.length > 1) {
+    const header = cashFlowValues[0];
+    const col = name => header.indexOf(name);
+    const iDate = col("Date");
+    const iType = col("Type");
+    const iAmount = col("Amount");
+    const iCurrency = col("Currency");
+
+    cashFlowValues.slice(1).forEach(row => {
+      if (iDate < 0 || !row[iDate]) return;
+      add(row[iDate], "flows", [text(row[iType]), num(row[iAmount]), text(row[iCurrency])]);
+    });
+  }
+
+  const signatures = {};
+  Object.keys(byDate).forEach(key => {
+    const d = byDate[key];
+    signatures[key] = `${d.trades}+${d.flows}:${shortHash_(d.lines.sort().join("\n"))}`;
+  });
+  return signatures;
+}
+
+/**
+ * First NAV row that can no longer be trusted. Everything from that row on
+ * is recomputed, because positions and cash are cumulative: a trade
+ * back-filled on day D changes D and every day after it.
+ *
+ * @param {Array<string>} weekdayKeys expected NAV dates, ascending
+ * @param {Array<Object>} navRows existing rows in sheet order: { dateKey, quality, sig }
+ * @param {Object} signatures see buildDailyInputSignatures_
+ * @return {number} index into weekdayKeys (== number of rows to keep), or
+ *   -1 when NAV_Daily is fully up to date
+ */
+function findFirstDirtyIndex_(weekdayKeys, navRows, signatures, todayKey) {
+  for (let i = 0; i < weekdayKeys.length; i++) {
+    const key = weekdayKeys[i];
+    const nav = navRows[i];
+    // Missing row, gap, duplicate or out-of-order date.
+    if (!nav || nav.dateKey !== key) return i;
+    // Today is always re-priced with live quotes.
+    if (key >= todayKey) return i;
+    // Snapshot taken with live/incomplete prices: finalize with the close.
+    if (nav.quality === NAV_QUALITY_LIVE_ || nav.quality === NAV_QUALITY_PENDING_) return i;
+    if (nav.sig !== (signatures[key] || "")) return i;
+  }
+  return navRows.length > weekdayKeys.length ? weekdayKeys.length : -1;
+}
+
+function readNavRows_(navSheet) {
+  const lastRow = navSheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const rows = navSheet.getRange(2, 1, lastRow - 1, NAV_COLUMN_COUNT_).getValues().map(row => ({
+    dateKey: row[0] ? formatDateKey_(row[0]) : "",
+    quality: String(row[8] || "").trim(),
+    sig: String(row[9] || "").trim()
+  }));
+  while (rows.length > 0 && !rows[rows.length - 1].dateKey) rows.pop();
+  return rows;
+}
+
+/**
+ * Open holdings at the close of each requested date, replaying Trades in
+ * memory with the same rules as Positions (calculatePositionsFromTradeRows_).
+ * @return {Object} dateKey -> { symbol: { quantity, currency } }
+ */
+function buildHoldingsByDate_(tradeValues, dateKeys) {
+  const result = {};
+  const header = tradeValues && tradeValues.length > 0 ? tradeValues[0] : [];
+  const iDate = header.indexOf("Date");
+
+  const dated = (tradeValues || []).slice(1)
+    .filter(row => row[iDate])
+    .map((row, idx) => ({ row, idx, key: formatDateKey_(row[iDate]) }))
+    .sort((a, b) => a.key === b.key ? a.idx - b.idx : (a.key < b.key ? -1 : 1));
+
+  let count = 0;
+  dateKeys.forEach(key => {
+    while (count < dated.length && dated[count].key <= key) count++;
+    const positions = count > 0
+      ? calculatePositionsFromTradeRows_(header, dated.slice(0, count).map(d => d.row))
+      : {};
+
+    const holdings = {};
+    Object.keys(positions).forEach(symbol => {
+      const p = positions[symbol];
+      if (p.quantity > 0) holdings[symbol] = { quantity: p.quantity, currency: p.currency };
+    });
+    result[key] = holdings;
+  });
+  return result;
+}
+
+/**
+ * FX for the sync: cached historical rate for past dates, this run's live
+ * rate for today (its close is not published yet).
+ */
+function makeSyncFxLookup_(fxHistoryMap, liveFxMap, todayKey) {
+  const historical = makeHistoricalFxLookup_(fxHistoryMap);
+  return function(currency, dateKey) {
+    if (currency === "CNY") return 1;
+    if (dateKey >= todayKey && liveFxMap[currency]) return liveFxMap[currency];
+    return historical(currency, dateKey);
+  };
+}
+
+function hasForeignCurrency_(sheetValues) {
+  if (!sheetValues || sheetValues.length < 2) return false;
+  const iCurrency = sheetValues[0].indexOf("Currency");
+  if (iCurrency < 0) return false;
+  return sheetValues.slice(1).some(row => {
+    const currency = String(row[iCurrency] || "").trim().toUpperCase();
+    return currency && currency !== "CNY";
+  });
+}
+
+function getEarliestDateKey_(sheetValuesList) {
+  let earliest = null;
+  sheetValuesList.forEach(values => {
+    if (!values || values.length < 2) return;
     const iDate = values[0].indexOf("Date");
     if (iDate < 0) return;
-    values.slice(1).forEach(r => { if (r[iDate]) dates.push(dateOnlyMs_(r[iDate])); });
+    values.slice(1).forEach(row => {
+      if (!row[iDate]) return;
+      const key = formatDateKey_(row[iDate]);
+      if (earliest === null || key < earliest) earliest = key;
+    });
   });
+  return earliest;
+}
 
-  if (dates.length === 0) {
-    throw new Error("No Trades or CashFlow data found to determine rebuild start date.");
+/**
+ * Bring CashLedger and NAV_Daily in line with Trades/CashFlow.
+ *
+ * There is no separate "full rebuild": every run compares each NAV row's
+ * stored InputSig with the current Trades/CashFlow rows for that date and
+ * recomputes from the first mismatch through today. That covers trades
+ * recorded late, edited trades, days the script did not run, and the very
+ * first run (no rows yet). To force a rebuild from some date, delete the
+ * NAV_Daily rows from that date down.
+ *
+ * Past dates are priced with cached historical closes/FX; today uses the
+ * live Positions prices and is marked LIVE so the next run finalizes it.
+ *
+ * @param {Object} fxMap live rates from getFxToCnyMap_
+ */
+function syncCashAndNavHistory_(spreadsheet, fxMap) {
+  const navSheet = spreadsheet.getSheetByName("NAV_Daily");
+  const tradesSheet = spreadsheet.getSheetByName("Trades");
+  if (!navSheet || !tradesSheet) {
+    throw new Error('Missing sheet: "NAV_Daily" or "Trades"');
   }
-  return formatDateKey_(new Date(Math.min(...dates)));
-}
 
-/**
- * Deliberate, explicit full historical rebuild of CashLedger and NAV_Daily
- * from the earliest Trades/CashFlow date to today, using cached historical
- * FX/prices (not "today"'s live rate/price). Idempotent and safe to
- * re-run — it never touches Trades or CashFlow (the originals).
- */
-function rebuildCashAndNavHistory() {
-  const spreadsheet = getSpreadsheet_();
-  ensurePerformanceSheets_(spreadsheet);
+  const cashFlowSheet = spreadsheet.getSheetByName("CashFlow");
+  const tradeValues = tradesSheet.getDataRange().getValues();
+  const cashFlowValues = cashFlowSheet ? cashFlowSheet.getDataRange().getValues() : [];
 
-  const startKey = getEarliestDataDateKey_(spreadsheet);
+  const startKey = getEarliestDateKey_([tradeValues, cashFlowValues]);
+  if (!startKey) {
+    Logger.log("No Trades or CashFlow data, skip cash/NAV sync.");
+    return;
+  }
+
   const todayKey = formatDateKey_(getTodayDateOnly_(spreadsheet));
-  Logger.log(`Rebuilding cash/NAV history from ${startKey} to ${todayKey}...`);
+  const weekdayKeys = enumerateWeekdayDateKeys_(startKey, todayKey);
+  const signatures = buildDailyInputSignatures_(tradeValues, cashFlowValues);
+  const firstDirty = findFirstDirtyIndex_(weekdayKeys, readNavRows_(navSheet), signatures, todayKey);
+  if (firstDirty === -1) {
+    Logger.log("NAV_Daily is up to date, nothing to recompute.");
+    return;
+  }
 
-  ensureFxHistoryCached_(spreadsheet, startKey, todayKey);
+  const dirtyKeys = weekdayKeys.slice(firstDirty);
+  const pastDirtyKeys = dirtyKeys.filter(k => k < todayKey);
+  Logger.log(dirtyKeys.length > 0
+    ? `Recomputing NAV_Daily from ${dirtyKeys[0]} (${dirtyKeys.length} rows).`
+    : "Trimming extra NAV_Daily rows.");
 
-  const fxLookup = makeHistoricalFxLookup_(loadFxHistoryMap_(spreadsheet));
+  const pastWeekdayKeys = weekdayKeys.filter(k => k < todayKey);
+  if (pastWeekdayKeys.length > 0 &&
+      (hasForeignCurrency_(tradeValues) || hasForeignCurrency_(cashFlowValues))) {
+    ensureFxHistoryCached_(spreadsheet, startKey, pastWeekdayKeys[pastWeekdayKeys.length - 1]);
+  }
+  const fxLookup = makeSyncFxLookup_(loadFxHistoryMap_(spreadsheet), fxMap, todayKey);
+
   fillCashFlowDerivedFields_(spreadsheet, fxLookup);
-
-  const symbols = Object.keys(buildPositionsFromTrades_(spreadsheet));
-  ensurePriceHistoryCached_(spreadsheet, symbols, startKey, todayKey);
-
-  rebuildCashLedgerHistory_(spreadsheet);
-  rebuildNavDailyHistory_(spreadsheet, startKey, todayKey);
-
-  Logger.log("Cash/NAV history rebuild complete.");
-}
-
-/**
- * Full NAV_Daily rebuild: for every weekday in range, replay Trades up to
- * that date (buildPositionsAsOfDate_) and price it with that day's cached
- * historical price/FX — not today's live Positions/LastPrice.
- */
-function rebuildNavDailyHistory_(spreadsheet, startKey, endKey) {
-  const sheet = spreadsheet.getSheetByName("NAV_Daily");
-  if (!sheet) throw new Error('Sheet "NAV_Daily" not found');
-
-  const fxLookup = makeHistoricalFxLookup_(loadFxHistoryMap_(spreadsheet));
-  const priceLookup = makeHistoricalPriceLookup_(loadPriceHistoryMap_(spreadsheet));
-
   const tradeFlows = getDailyTradeCashFlowsCNY_(spreadsheet, fxLookup);
   const externalFlows = getDailyExternalCashFlowsCNY_(spreadsheet, fxLookup);
   const walked = walkCashBalances_(tradeFlows, externalFlows);
+  writeCashLedger_(spreadsheet, walked);
 
-  const cashByDate = {};
-  walked.forEach(w => { cashByDate[w.date] = w.cashBalance; });
-  const cashKeys = walked.map(w => w.date);
-
-  const weekdayKeys = enumerateWeekdayDateKeys_(startKey, endKey);
-
-  const rows = [];
-  const dataQualityFlags = [];
-
-  weekdayKeys.forEach(key => {
-    const asOfDate = new Date(key + "T00:00:00");
-    const positions = buildPositionsAsOfDate_(spreadsheet, asOfDate);
-
-    let equity = 0;
-    let estimated = false;
-    Object.keys(positions).forEach(symbol => {
-      const p = positions[symbol];
-      if (p.quantity <= 0) return;
-      const price = priceLookup(symbol, key);
-      if (price === null) { estimated = true; return; }
-      const fx = p.currency === "CNY" ? 1 : fxLookup(p.currency, key);
-      equity += p.quantity * price * fx;
+  const holdingsByDate = buildHoldingsByDate_(tradeValues, dirtyKeys);
+  const neededBySymbol = {};
+  pastDirtyKeys.forEach(key => {
+    Object.keys(holdingsByDate[key]).forEach(symbol => {
+      if (!neededBySymbol[symbol]) neededBySymbol[symbol] = [];
+      neededBySymbol[symbol].push(key);
     });
+  });
+  ensurePriceHistoryCached_(spreadsheet, neededBySymbol, todayKey);
+  const priceLookup = makeHistoricalPriceLookup_(loadPriceHistoryMap_(spreadsheet));
 
-    let cashBalance = 0;
-    for (let i = cashKeys.length - 1; i >= 0; i--) {
-      if (cashKeys[i] <= key) { cashBalance = cashByDate[cashKeys[i]]; break; }
-    }
+  const liveEquity = dirtyKeys.indexOf(todayKey) >= 0
+    ? computeEquityValueCNY_(spreadsheet, fxMap)
+    : 0;
 
-    const externalFlow = roundMoney_(externalFlows[key] || 0);
-    const totalAsset = roundMoney_(equity + cashBalance);
-
-    rows.push([asOfDate, roundMoney_(equity), cashBalance, externalFlow, totalAsset]);
-    dataQualityFlags.push(estimated ? "ESTIMATED" : "");
+  const rows = computeNavRows_({
+    dateKeys: dirtyKeys,
+    prevDateKey: firstDirty > 0 ? weekdayKeys[firstDirty - 1] : "",
+    todayKey: todayKey,
+    liveEquity: liveEquity,
+    holdingsByDate: holdingsByDate,
+    priceLookup: priceLookup,
+    fxLookup: fxLookup,
+    walked: walked,
+    externalFlows: externalFlows,
+    signatures: signatures
   });
 
-  const lastRow = sheet.getLastRow();
-  if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
-  if (rows.length === 0) return;
-
-  sheet.getRange(2, 1, rows.length, 5).setValues(rows);
-
-  for (let i = 0; i < rows.length; i++) {
-    const r = i + 2;
-    if (i === 0) {
-      sheet.getRange(r, 6, 1, 3).setValues([["", "", ""]]);
-    } else {
-      sheet.getRange(r, 6).setFormula(`=E${r - 1}`);
-      sheet.getRange(r, 7).setFormula(`=E${r}-F${r}-D${r}`);
-      sheet.getRange(r, 8).setFormula(`=IF(F${r}+D${r}=0,,G${r}/(F${r}+D${r}))`);
-    }
-  }
-
-  sheet.getRange(2, 9, dataQualityFlags.length, 1).setValues(dataQualityFlags.map(v => [v]));
-
-  Logger.log(`NAV_Daily history rebuilt: ${rows.length} rows.`);
+  writeNavRows_(navSheet, firstDirty + 2, rows);
+  Logger.log(`NAV_Daily synced: ${rows.length} rows written.`);
 }
 
 /**
- * After a successful daily run, cache today's live price/FX into
- * FxHistory/PriceHistory so a future rebuild never needs to re-fetch them.
+ * Pure NAV row computation for consecutive weekday dates.
+ * @return {Array<Object>} { dateKey, equity, cashBalance, externalFlow, totalAsset, quality, sig }
  */
-function appendTodayToHistoryCaches_(spreadsheet, fxMap) {
-  const todayKey = formatDateKey_(getTodayDateOnly_(spreadsheet));
+function computeNavRows_(input) {
+  const cashKeys = input.walked.map(w => w.date);
+  const flowKeys = Object.keys(input.externalFlows).sort();
+  let cashIdx = -1;
+  let prevKey = input.prevDateKey;
 
-  const fxSheet = spreadsheet.getSheetByName("FxHistory");
-  if (fxSheet) {
-    const existing = loadFxHistoryMap_(spreadsheet);
-    if (!existing[todayKey]) {
-      const lastRow = fxSheet.getLastRow();
-      fxSheet.getRange(lastRow + 1, 1, 1, 4).setValues([[
-        new Date(todayKey + "T00:00:00"), fxMap.USD || "", fxMap.HKD || "", "Live"
-      ]]);
+  return input.dateKeys.map(key => {
+    let equity = 0;
+    let quality = "";
+
+    if (key >= input.todayKey) {
+      equity = input.liveEquity;
+      quality = NAV_QUALITY_LIVE_;
+    } else {
+      let estimated = false;
+      let pending = false;
+      const holdings = input.holdingsByDate[key];
+      Object.keys(holdings).forEach(symbol => {
+        const h = holdings[symbol];
+        const quote = input.priceLookup(symbol, key);
+        if (!quote.settled) pending = true;
+        if (quote.price === null) { estimated = true; return; }
+        equity += h.quantity * quote.price * input.fxLookup(h.currency, key);
+      });
+      quality = pending ? NAV_QUALITY_PENDING_ : (estimated ? "ESTIMATED" : "");
     }
-  }
 
-  const posSheet = spreadsheet.getSheetByName("Positions");
-  const priceSheet = spreadsheet.getSheetByName("PriceHistory");
-  if (!posSheet || !priceSheet) return;
+    while (cashIdx + 1 < cashKeys.length && cashKeys[cashIdx + 1] <= key) cashIdx++;
+    const cashBalance = cashIdx >= 0 ? input.walked[cashIdx].cashBalance : 0;
 
-  const data = posSheet.getDataRange().getValues();
-  if (data.length <= 2) return;
+    // Includes flows dated on the weekend/gap since the previous NAV row.
+    const externalFlow = roundMoney_(flowKeys
+      .filter(k => k > prevKey && k <= key)
+      .reduce((sum, k) => sum + input.externalFlows[k], 0));
+    prevKey = key;
 
-  const header = data[0];
-  const col = name => header.indexOf(name);
-  const iMarket = col("Market");
-  const iSymbol = col("Symbol");
-  const iPrice = col("LastPrice");
-  const iCurrency = col("Currency");
-
-  const existingPrices = loadPriceHistoryMap_(spreadsheet);
-  const rowsToAppend = [];
-
-  for (let i = 2; i < data.length; i++) {
-    const symbol = normalizeSymbol_(data[i][iSymbol]);
-    const price = Number(data[i][iPrice]) || 0;
-    if (!symbol || price <= 0) continue;
-    if (existingPrices[symbol] && existingPrices[symbol][todayKey] !== undefined) continue;
-
-    rowsToAppend.push([
-      new Date(todayKey + "T00:00:00"),
-      symbol,
-      data[i][iMarket] || "",
-      price,
-      data[i][iCurrency] || "",
-      "Live"
-    ]);
-  }
-
-  if (rowsToAppend.length > 0) {
-    const lastRow = priceSheet.getLastRow();
-    priceSheet.getRange(lastRow + 1, 1, rowsToAppend.length, 6).setValues(rowsToAppend);
-  }
+    return {
+      dateKey: key,
+      equity: roundMoney_(equity),
+      cashBalance: cashBalance,
+      externalFlow: externalFlow,
+      totalAsset: roundMoney_(equity + cashBalance),
+      quality: quality,
+      sig: input.signatures[key] || ""
+    };
+  });
 }
 
-function isWeekdayTradingDay_(spreadsheet) {
-  const tz = spreadsheet.getSpreadsheetTimeZone() || Session.getScriptTimeZone();
-  const today = new Date();
-  const day = Number(Utilities.formatDate(today, tz, "u")); // 1..7 (Mon..Sun)
-  return day <= 5;
+/**
+ * Overwrite NAV_Daily from startRow down with the given rows and clear
+ * whatever was below. Rows above startRow are left untouched.
+ */
+function writeNavRows_(navSheet, startRow, rows) {
+  const lastRow = navSheet.getLastRow();
+  if (lastRow >= startRow) {
+    navSheet.getRange(startRow, 1, lastRow - startRow + 1, NAV_COLUMN_COUNT_).clearContent();
+  }
+  if (rows.length === 0) return;
+
+  navSheet.getRange(startRow, 1, rows.length, 5).setValues(rows.map(r => [
+    new Date(r.dateKey + "T00:00:00"),
+    r.equity,
+    r.cashBalance,
+    r.externalFlow,
+    r.totalAsset
+  ]));
+
+  // Derived columns F:G:H. The first NAV row has no previous day.
+  navSheet.getRange(startRow, 6, rows.length, 3).setFormulas(rows.map((_, i) => {
+    const r = startRow + i;
+    if (r === 2) return ["", "", ""];
+    return [
+      `=E${r - 1}`,
+      `=E${r}-F${r}-D${r}`,
+      `=IF(F${r}+D${r}=0,,G${r}/(F${r}+D${r}))`
+    ];
+  }));
+
+  navSheet.getRange(startRow, 9, rows.length, 2).setValues(rows.map(r => [r.quality, r.sig]));
 }
 
 function getTodayDateOnly_(spreadsheet) {

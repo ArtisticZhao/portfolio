@@ -82,3 +82,125 @@ function testWalkCashBalancesNoAutoDeposit_() {
   assertAlmostEqual_(rows[1].cashBalance, -10, "day 2 balance");
   assertAlmostEqual_(rows[2].cashBalance, -70, "day 3 balance");
 }
+
+function assertEqual_(actual, expected, label) {
+  if (actual !== expected) {
+    throw new Error(`${label}: expected ${expected}, got ${actual}`);
+  }
+}
+
+const TEST_TRADE_HEADER_ = ["Date", "Name", "Symbol", "Side", "Quantity", "Price", "Currency", "Fee", "Tax", "OtherCost"];
+
+function testTradeRow_(dateKey, symbol, side, qty, price) {
+  return [new Date(dateKey + "T00:00:00"), "", symbol, side, qty, price, "CNY", 5, 0, 0];
+}
+
+/**
+ * InputSig must change when a trade is back-filled or edited, and must not
+ * change when rows are merely reordered.
+ */
+function testDailyInputSignatures_() {
+  const buy = testTradeRow_("2026-10-08", "600519", "BUY", 100, 10);
+  const sell = testTradeRow_("2026-10-09", "600519", "SELL", 100, 11);
+  const late = testTradeRow_("2026-10-08", "000001", "BUY", 200, 5);
+
+  const base = buildDailyInputSignatures_([TEST_TRADE_HEADER_, buy, sell], []);
+  assertEqual_(base["2026-10-08"].split(":")[0], "1+0", "one trade counted");
+  assertEqual_(base["2026-10-07"], undefined, "no signature without input");
+
+  const backfilled = buildDailyInputSignatures_([TEST_TRADE_HEADER_, buy, sell, late], []);
+  assertEqual_(backfilled["2026-10-08"].split(":")[0], "2+0", "back-filled trade counted");
+  assertEqual_(backfilled["2026-10-09"], base["2026-10-09"], "other day untouched");
+
+  const reordered = buildDailyInputSignatures_([TEST_TRADE_HEADER_, late, sell, buy], []);
+  assertEqual_(reordered["2026-10-08"], backfilled["2026-10-08"], "row order ignored");
+
+  const edited = buildDailyInputSignatures_(
+    [TEST_TRADE_HEADER_, testTradeRow_("2026-10-08", "600519", "BUY", 100, 10.5), sell], []
+  );
+  assertEqual_(edited["2026-10-08"].split(":")[0], "1+0", "edit keeps the count");
+  assertEqual_(edited["2026-10-08"] !== base["2026-10-08"], true, "edited price changes signature");
+
+  // 2026-10-10 is a Saturday: accounted for on Monday's NAV row.
+  const weekend = buildDailyInputSignatures_(
+    [TEST_TRADE_HEADER_],
+    [["Date", "Type", "Amount", "Currency"], [new Date("2026-10-10T00:00:00"), "Deposit", 1000, "CNY"]]
+  );
+  assertEqual_(weekend["2026-10-12"].split(":")[0], "0+1", "weekend flow rolls to Monday");
+}
+
+function testFindFirstDirtyIndex_() {
+  const keys = ["2026-10-08", "2026-10-09", "2026-10-12", "2026-10-13"];
+  const sigs = { "2026-10-08": "1+0:aaaaaaaa", "2026-10-12": "2+0:bbbbbbbb" };
+  const nav = () => [
+    { dateKey: "2026-10-08", quality: "", sig: "1+0:aaaaaaaa" },
+    { dateKey: "2026-10-09", quality: "", sig: "" },
+    { dateKey: "2026-10-12", quality: "", sig: "2+0:bbbbbbbb" }
+  ];
+
+  // Weekend run with nothing new: fully up to date.
+  assertEqual_(findFirstDirtyIndex_(keys.slice(0, 3), nav(), sigs, "2026-10-17"), -1, "clean");
+  // Weekday run: only today's row is rewritten.
+  assertEqual_(findFirstDirtyIndex_(keys, nav(), sigs, "2026-10-13"), 3, "today only");
+
+  // A trade back-filled on 10-09 after that row was computed.
+  const backfilled = Object.assign({}, sigs, { "2026-10-09": "1+0:cccccccc" });
+  assertEqual_(findFirstDirtyIndex_(keys, nav(), backfilled, "2026-10-13"), 1, "back-fill");
+
+  // The only trade of a day was deleted.
+  const deleted = { "2026-10-12": "2+0:bbbbbbbb" };
+  assertEqual_(findFirstDirtyIndex_(keys, nav(), deleted, "2026-10-13"), 0, "deletion");
+
+  // Script did not run on 10-09: the row is missing.
+  const gap = nav();
+  gap.splice(1, 1);
+  assertEqual_(findFirstDirtyIndex_(keys, gap, sigs, "2026-10-13"), 1, "missing row");
+
+  // Yesterday's live snapshot gets finalized with the close.
+  const live = nav();
+  live[2].quality = "LIVE";
+  assertEqual_(findFirstDirtyIndex_(keys, live, sigs, "2026-10-13"), 2, "live finalize");
+
+  assertEqual_(findFirstDirtyIndex_(keys, [], sigs, "2026-10-13"), 0, "first run");
+}
+
+/**
+ * A trade back-filled on day 1 changes holdings, and so NAV, on every later
+ * day as well.
+ */
+function testComputeNavRowsAfterBackfill_() {
+  const keys = ["2026-10-08", "2026-10-09"];
+  const trades = [
+    TEST_TRADE_HEADER_,
+    testTradeRow_("2026-10-09", "600519", "SELL", 50, 12),
+    testTradeRow_("2026-10-08", "600519", "BUY", 100, 10)
+  ];
+  const holdings = buildHoldingsByDate_(trades, keys);
+  assertAlmostEqual_(holdings["2026-10-08"]["600519"].quantity, 100, "day 1 holding");
+  assertAlmostEqual_(holdings["2026-10-09"]["600519"].quantity, 50, "day 2 holding");
+
+  const prices = { "2026-10-08": 11, "2026-10-09": 12 };
+  const tradeFlows = { "2026-10-08": -1005, "2026-10-09": 595 };
+  const externalFlows = { "2026-10-08": 2000 };
+
+  const rows = computeNavRows_({
+    dateKeys: keys,
+    prevDateKey: "",
+    todayKey: "2026-10-12",
+    liveEquity: 0,
+    holdingsByDate: holdings,
+    priceLookup: (symbol, key) => ({ price: prices[key], settled: true }),
+    fxLookup: () => 1,
+    walked: walkCashBalances_(tradeFlows, externalFlows),
+    externalFlows: externalFlows,
+    signatures: { "2026-10-08": "1+0:aaaaaaaa" }
+  });
+
+  assertAlmostEqual_(rows[0].equity, 1100, "day 1 equity");
+  assertAlmostEqual_(rows[0].cashBalance, 995, "day 1 cash");
+  assertAlmostEqual_(rows[0].externalFlow, 2000, "day 1 external flow");
+  assertAlmostEqual_(rows[1].equity, 600, "day 2 equity");
+  assertAlmostEqual_(rows[1].totalAsset, 2190, "day 2 total asset");
+  assertEqual_(rows[0].sig, "1+0:aaaaaaaa", "signature stored");
+  assertEqual_(rows[1].quality, "", "settled close is final");
+}
