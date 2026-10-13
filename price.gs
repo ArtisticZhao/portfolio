@@ -49,18 +49,24 @@ function fetchFromGoogle_(assets) {
         .getRange(row, 1)
         .setFormula(`=IFERROR(GOOGLEFINANCE("${a.symbol}", "name"), "")`);
 
-      // Price (fallback to last close)
+      // Price (fallback to last close). Currency pairs only resolve without
+      // an attribute ("price" yields #N/A), and a "close" query returns a
+      // Date/Close table, so the value has to be picked out with INDEX.
+      const live = /^CURRENCY:/i.test(a.symbol)
+        ? `GOOGLEFINANCE("${a.symbol}")`
+        : `GOOGLEFINANCE("${a.symbol}", "price")`;
       tempSheet
         .getRange(row, 2)
         .setFormula(
           `=IFERROR(` +
-          `GOOGLEFINANCE("${a.symbol}", "price"),` +
-          `IFERROR(GOOGLEFINANCE("${a.symbol}", "close", WORKDAY(TODAY()-1,-1)), "")` +
+          `${live},` +
+          `IFERROR(INDEX(GOOGLEFINANCE("${a.symbol}", "close", WORKDAY(TODAY()-1,-1)), 2, 2), "")` +
           `)`
         );
     });
 
     // Wait for formulas to evaluate
+    SpreadsheetApp.flush();
     Utilities.sleep(8000);
 
     const values = tempSheet
@@ -115,25 +121,34 @@ function fetchGoogleFinanceHistoryBatch_(assets, startDateKey, endDateKey) {
   const tempSheet = tempSs.getSheets()[0];
 
   try {
+    // No IFERROR wrapper: it strips the date format off the spilled table,
+    // so the Date column would come back as serial numbers. A failed lookup
+    // just leaves "#N/A" in the first cell, which is skipped below.
     assets.forEach((a, index) => {
       const col = index * 2 + 1;
       const sym = a.googleSymbol || a.symbol;
       tempSheet
         .getRange(1, col)
-        .setFormula(`=IFERROR(GOOGLEFINANCE("${sym}","close",${startExpr},${endExpr}),"")`);
+        .setFormula(`=GOOGLEFINANCE("${sym}","close",${startExpr},${endExpr})`);
     });
 
+    SpreadsheetApp.flush();
     Utilities.sleep(10000);
+
+    // The table's timestamps are in the temp spreadsheet's timezone, which
+    // need not match the script's.
+    const tz = tempSs.getSpreadsheetTimeZone();
+    const rowCount = tempSheet.getMaxRows();
 
     assets.forEach((a, index) => {
       const col = index * 2 + 1;
-      const rows = tempSheet.getRange(1, col, 3000, 2).getValues();
+      const rows = tempSheet.getRange(1, col, rowCount, 2).getValues();
       const map = {};
       rows.forEach(r => {
         if (!(r[0] instanceof Date)) return;
         const close = Number(r[1]);
         if (!isNaN(close) && close > 0) {
-          map[formatDateKey_(r[0])] = close;
+          map[Utilities.formatDate(r[0], tz, "yyyy-MM-dd")] = close;
         }
       });
       result[a.symbol] = map;
