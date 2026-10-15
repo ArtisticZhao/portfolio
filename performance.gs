@@ -434,7 +434,11 @@ function loadPriceHistoryMap_(spreadsheet) {
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
     if (!row[iDate] || !row[iSymbol]) continue;
-    const symbol = normalizeSymbol_(row[iSymbol]);
+    // Rows written before Symbol was forced to text came back as numbers
+    // ("002317" -> 2317); restore the 6-digit A-share code.
+    const symbol = typeof row[iSymbol] === "number"
+      ? String(row[iSymbol]).padStart(6, "0")
+      : normalizeSymbol_(row[iSymbol]);
     const key = formatDateKey_(row[iDate]);
     const price = Number(row[iClose]) || 0;
     if (!map[symbol]) map[symbol] = {};
@@ -539,9 +543,9 @@ function ensureFxHistoryCached_(spreadsheet, startDateKey, endDateKey) {
 
 /**
  * Ensure PriceHistory has an entry (close or NO_DATA marker) for every
- * requested symbol/date. CN -> Tushare daily; HK -> Tushare hk_daily;
- * anything left (US, or a Tushare failure) -> one batched GOOGLEFINANCE
- * historical call. Only fetches what's missing; safe to call repeatedly.
+ * requested symbol/date. CN stocks -> Tushare daily, then Sina; CN
+ * funds/ETFs -> Sina; HK and US -> one batched GOOGLEFINANCE historical
+ * call. Only fetches what's missing; safe to call repeatedly.
  *
  * @param {Object} neededBySymbol symbol -> [dateKey] the symbol was held on
  * @param {string} todayKey NO_DATA markers are only written for dates older
@@ -582,23 +586,30 @@ function ensurePriceHistoryCached_(spreadsheet, neededBySymbol, todayKey) {
     let fetchedMap = null;
 
     if (market === "CN") {
-      const tsCode = symbolToTsCode_(symbol);
-      try {
-        fetchedMap = fetchTushareDaily_(tsCode, startDateKey, endDateKey);
-        if (Object.keys(fetchedMap).length > 0) perSymbolResult[symbol] = { map: fetchedMap, source: "Tushare" };
-      } catch (e) {
-        Logger.log(`Tushare daily failed for ${symbol}: ${e.message}`);
+      // Tushare "daily" only covers stocks, so funds/ETFs (e.g. 513300) go
+      // straight to Sina; stocks fall back to it when Tushare has nothing.
+      if (!isCnFundOrEtfSymbol_(symbol)) {
+        try {
+          fetchedMap = fetchTushareDaily_(symbolToTsCode_(symbol), startDateKey, endDateKey);
+          if (Object.keys(fetchedMap).length > 0) perSymbolResult[symbol] = { map: fetchedMap, source: "Tushare" };
+        } catch (e) {
+          Logger.log(`Tushare daily failed for ${symbol}: ${e.message}`);
+        }
       }
-    } else if (market === "HK") {
-      const tsCode = hkSymbolToTsCode_(symbol);
-      try {
-        fetchedMap = fetchTushareHkDaily_(tsCode, startDateKey, endDateKey);
-        if (Object.keys(fetchedMap).length > 0) perSymbolResult[symbol] = { map: fetchedMap, source: "Tushare" };
-      } catch (e) {
-        Logger.log(`Tushare hk_daily failed for ${symbol}: ${e.message}`);
+      if (!perSymbolResult[symbol]) {
+        try {
+          fetchedMap = fetchSinaDailyHistory_(symbol, startDateKey, endDateKey);
+        } catch (e) {
+          Logger.log(`Sina history failed for ${symbol}: ${e.message}`);
+          fetchedMap = {};
+        }
+        // GOOGLEFINANCE has no A-share history, so there is no further fallback.
+        perSymbolResult[symbol] = { map: fetchedMap, source: "Sina" };
       }
     }
 
+    // HK and US go to GOOGLEFINANCE (Tushare hk_daily is limited to one
+    // call per minute on this account, so it is not used).
     if (!perSymbolResult[symbol]) googleFallbackSymbols.push(symbol);
   });
 
@@ -645,6 +656,8 @@ function ensurePriceHistoryCached_(spreadsheet, neededBySymbol, todayKey) {
 
   if (rowsToAppend.length > 0) {
     const lastRow = sheet.getLastRow();
+    // Keep Symbol as text, otherwise Sheets turns "002317" into 2317.
+    sheet.getRange(lastRow + 1, 2, rowsToAppend.length, 1).setNumberFormat("@");
     sheet.getRange(lastRow + 1, 1, rowsToAppend.length, 6).setValues(rowsToAppend);
     Logger.log(`PriceHistory appended ${rowsToAppend.length} rows.`);
   }

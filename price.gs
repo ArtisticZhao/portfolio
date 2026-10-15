@@ -231,6 +231,50 @@ function fetchFromSina_(assets) {
 }
 
 /**
+ * Fetch historical daily closes (unadjusted) for one A-share stock or ETF
+ * from Sina's K-line service. The service returns the most recent N trading
+ * days (N <= 1023, about four years), so anything older is not available.
+ *
+ * @param {string} symbol e.g. "513300"
+ * @param {string} startDateKey "yyyy-MM-dd"
+ * @param {string} endDateKey "yyyy-MM-dd"
+ * @return {Object} "yyyy-MM-dd" -> close
+ */
+function fetchSinaDailyHistory_(symbol, startDateKey, endDateKey) {
+  const sina = convertToSinaSymbol_(symbol);
+  if (!sina) throw new Error(`Cannot convert "${symbol}" to a Sina symbol`);
+
+  const url = "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData" +
+    `?symbol=${sina}&scale=240&ma=no&datalen=1023`;
+  const response = UrlFetchApp.fetch(url, {
+    muteHttpExceptions: true,
+    headers: {
+      Referer: "https://finance.sina.com.cn"
+    }
+  });
+
+  const text = response.getContentText();
+  let rows;
+  try {
+    rows = JSON.parse(text);
+  } catch (e) {
+    rows = null;
+  }
+  if (!Array.isArray(rows)) {
+    throw new Error(`Unexpected Sina response (HTTP ${response.getResponseCode()}): ${text.slice(0, 200)}`);
+  }
+
+  const result = {};
+  rows.forEach(row => {
+    const close = parseFloat(row.close);
+    if (row.day >= startDateKey && row.day <= endDateKey && close > 0) {
+      result[row.day] = close;
+    }
+  });
+  return result;
+}
+
+/**
  * Convert CN listed security symbol to Sina format.
  * Supports:
  * - SSE stocks: 6xxxxx -> sh6xxxxx

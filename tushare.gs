@@ -59,15 +59,6 @@ function fetchTushareDaily_(tsCode, startDateKey, endDateKey) {
   return parseTushareDateCloseRows_(data);
 }
 
-function fetchTushareHkDaily_(tsCode, startDateKey, endDateKey) {
-  const data = callTushare_(
-    "hk_daily",
-    { ts_code: tsCode, start_date: startDateKey.replace(/-/g, ""), end_date: endDateKey.replace(/-/g, "") },
-    "trade_date,close"
-  );
-  return parseTushareDateCloseRows_(data);
-}
-
 /**
  * "002317" -> "002317.SZ" / "600519" -> "600519.SH". Mirrors convertToSinaSymbol_ (price.gs).
  */
@@ -78,11 +69,3 @@ function symbolToTsCode_(symbol) {
   return null;
 }
 
-/**
- * "HKG:0600" -> "00600.HK"
- */
-function hkSymbolToTsCode_(symbol) {
-  const m = String(symbol).trim().match(/^HKG:(\d{4})$/);
-  if (!m) return null;
-  return m[1].padStart(5, "0") + ".HK";
-}
