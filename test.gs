@@ -63,24 +63,33 @@ function testBuildPositionsFromTradesWeightedCost_() {
 }
 
 /**
- * No more AutoDeposit floor: cash balance is a plain running sum of trade
- * + external flows, and is allowed to go negative (a real signal, not
- * something to paper over with a synthetic deposit).
+ * Auto funding: a shortfall is covered by exactly the missing amount, and
+ * cash left over from sales funds later buys before any new money is added.
  */
-function testWalkCashBalancesNoAutoDeposit_() {
+function testWalkCashBalancesAutoFunding_() {
   const tradeFlows = {
     "2026-01-01": -100,
     "2026-01-02": 40,
-    "2026-01-03": -60
+    "2026-01-03": -60,
+    "2026-01-05": -30
   };
   const externalFlows = {
-    "2026-01-01": 50
+    "2026-01-01": 50,
+    "2026-01-04": -5
   };
 
   const rows = walkCashBalances_(tradeFlows, externalFlows);
-  assertAlmostEqual_(rows[0].cashBalance, -50, "day 1 balance (no auto deposit, negative allowed)");
-  assertAlmostEqual_(rows[1].cashBalance, -10, "day 2 balance");
-  assertAlmostEqual_(rows[2].cashBalance, -70, "day 3 balance");
+  assertAlmostEqual_(rows[0].autoFund, 50, "day 1 auto funds the shortfall after manual deposit");
+  assertAlmostEqual_(rows[0].externalFlow, 100, "day 1 external = manual + auto");
+  assertAlmostEqual_(rows[0].cashBalance, 0, "day 1 balance");
+  assertAlmostEqual_(rows[1].cashBalance, 40, "sale proceeds stay in the account");
+  assertAlmostEqual_(rows[2].autoFund, 20, "buy uses cash on hand first");
+  assertAlmostEqual_(rows[2].cashBalance, 0, "day 3 balance");
+  assertAlmostEqual_(rows[3].autoFund, 5, "withdrawal below zero is refilled");
+  assertAlmostEqual_(rows[4].autoFund, 30, "day 5 auto funding");
+  rows.forEach(r => {
+    if (r.cashBalance < 0) throw new Error(`negative cash on ${r.date}`);
+  });
 }
 
 function assertEqual_(actual, expected, label) {
@@ -192,7 +201,6 @@ function testComputeNavRowsAfterBackfill_() {
     priceLookup: (symbol, key) => ({ price: prices[key], settled: true }),
     fxLookup: () => 1,
     walked: walkCashBalances_(tradeFlows, externalFlows),
-    externalFlows: externalFlows,
     signatures: { "2026-10-08": "1+0:aaaaaaaa" }
   });
 
@@ -203,4 +211,46 @@ function testComputeNavRowsAfterBackfill_() {
   assertAlmostEqual_(rows[1].totalAsset, 2190, "day 2 total asset");
   assertEqual_(rows[0].sig, "1+0:aaaaaaaa", "signature stored");
   assertEqual_(rows[1].quality, "", "settled close is final");
+}
+
+/**
+ * Pure auto funding through NAV: a buy's auto-funded amount is external
+ * flow, so it does not show up as trading PnL. Starting mid-history only
+ * counts flows after prevDateKey.
+ */
+function testComputeNavRowsAutoFunding_() {
+  const keys = ["2026-10-08", "2026-10-09", "2026-10-12"];
+  const trades = [
+    TEST_TRADE_HEADER_,
+    testTradeRow_("2026-10-08", "600519", "BUY", 100, 10),
+    testTradeRow_("2026-10-09", "600519", "SELL", 50, 12),
+    testTradeRow_("2026-10-12", "600519", "BUY", 100, 12)
+  ];
+  const holdings = buildHoldingsByDate_(trades, keys);
+  const prices = { "2026-10-08": 11, "2026-10-09": 12, "2026-10-12": 12 };
+  const walked = walkCashBalances_({ "2026-10-08": -1005, "2026-10-09": 595, "2026-10-12": -1205 }, {});
+  const input = {
+    dateKeys: keys,
+    prevDateKey: "",
+    todayKey: "2026-10-13",
+    liveEquity: 0,
+    holdingsByDate: holdings,
+    priceLookup: (symbol, key) => ({ price: prices[key], settled: true }),
+    fxLookup: () => 1,
+    walked: walked,
+    signatures: {}
+  };
+
+  const rows = computeNavRows_(input);
+  assertAlmostEqual_(rows[0].externalFlow, 1005, "buy auto-funded");
+  assertAlmostEqual_(rows[0].cashBalance, 0, "no idle cash after auto funding");
+  assertAlmostEqual_(rows[1].externalFlow, 0, "sale needs no funding");
+  assertAlmostEqual_(rows[1].cashBalance, 595, "sale proceeds kept");
+  assertAlmostEqual_(rows[2].externalFlow, 610, "only the shortfall is funded");
+  assertAlmostEqual_(rows[2].cashBalance, 0, "day 3 cash");
+  // TradingPnL = total - prevTotal - externalFlow (NAV_Daily column G).
+  assertAlmostEqual_(rows[0].totalAsset - 0 - rows[0].externalFlow, 95, "day 1 PnL: +100 price, -5 fee");
+
+  const tail = computeNavRows_(Object.assign({}, input, { dateKeys: keys.slice(2), prevDateKey: keys[1] }));
+  assertAlmostEqual_(tail[0].externalFlow, 610, "mid-history start skips earlier flows");
 }
