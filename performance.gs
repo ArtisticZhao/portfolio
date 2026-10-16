@@ -13,9 +13,10 @@ const NAV_CALC_VERSION_ = "auto-funding-1";
 /**
  * Ensure performance-related sheets exist with expected headers.
  * Sheets:
- * - CashLedger: generated cash ledger from Trades + CashFlow (external flows)
+ * - CashLedger: cash generated from Trades alone; buys are auto-funded, so
+ *   NewMoneyCNY is the real money put in (see walkCashBalances_)
  * - NAV_Daily: daily account snapshot in CNY; InputSig records which
- *   Trades/CashFlow rows each row was computed from (see syncCashAndNavHistory_)
+ *   Trades rows each row was computed from (see syncCashAndNavHistory_)
  * - PnL_View: dashboard formulas
  * - FxHistory / PriceHistory: cache sheets for historical closes
  */
@@ -23,9 +24,11 @@ function ensurePerformanceSheets_(spreadsheet) {
   ensureSheetWithHeader_(spreadsheet, "CashLedger", [
     "Date",
     "TradeCashFlowCNY",
-    "ExternalCashFlowCNY",
+    "NewMoneyCNY",
     "CashBalanceCNY",
-    "Note"
+    "Note",
+    "ReinvestedCNY",
+    "TotalInvestedCNY"
   ]);
 
   ensureSheetWithHeader_(spreadsheet, "NAV_Daily", [
@@ -95,38 +98,51 @@ function ensureSheetWithHeader_(spreadsheet, name, headers, hidden) {
 }
 
 /**
- * Pure helper: walk-forward cumulative cash balance from per-date trade and
- * manual external (CashFlow) flows, auto-funding any shortfall.
+ * Pure helper: walk-forward cash balance from per-date trade flows, with
+ * buys auto-funded. Cash only ever comes in; there are no withdrawals.
  *
- * Auto funding: whenever a day would end with negative cash, exactly the
- * missing amount is treated as money deposited that day, so buys are funded
- * from cash on hand first (e.g. earlier sale proceeds) and only the rest
- * counts as new capital. Withdrawals are never inferred; record them in
- * CashFlow. externalFlow = manualFlow + autoFund and is what NAV_Daily
- * subtracts from the day's change in total asset.
- * @return {Array<{date, tradeFlow, manualFlow, autoFund, externalFlow, cashBalance}>} sorted by date
+ * Each day, sale/dividend proceeds are added to cash and buys are paid from
+ * cash first (reinvested); whatever cash cannot cover is new money put in
+ * that day. So newMoney summed over all days is the real capital invested,
+ * and newMoney is the external flow NAV_Daily excludes from trading PnL.
+ *
+ * @param {Object} dailyTradeFlows dateKey -> { buy, proceeds }, both >= 0 CNY
+ * @return {Array<{date, tradeFlow, newMoney, reinvested, cashBalance, totalInvested}>} sorted by date
  */
-function walkCashBalances_(tradeFlowsByDate, externalFlowsByDate) {
-  const allKeys = Array.from(
-    new Set(Object.keys(tradeFlowsByDate).concat(Object.keys(externalFlowsByDate)))
-  ).sort();
-
+function walkCashBalances_(dailyTradeFlows) {
   let cash = 0;
-  return allKeys.map(key => {
-    const tradeFlow = roundMoney_(tradeFlowsByDate[key] || 0);
-    const manualFlow = roundMoney_(externalFlowsByDate[key] || 0);
-    cash = roundMoney_(cash + tradeFlow + manualFlow);
-    const autoFund = cash < 0 ? roundMoney_(-cash) : 0;
-    cash = roundMoney_(cash + autoFund);
-    const externalFlow = roundMoney_(manualFlow + autoFund);
-    return { date: key, tradeFlow, manualFlow, autoFund, externalFlow, cashBalance: cash };
+  let totalInvested = 0;
+  return Object.keys(dailyTradeFlows).sort().map(key => {
+    const buy = roundMoney_(dailyTradeFlows[key].buy || 0);
+    const proceeds = roundMoney_(dailyTradeFlows[key].proceeds || 0);
+    const available = roundMoney_(cash + proceeds);
+    const reinvested = Math.min(buy, available);
+    const newMoney = roundMoney_(buy - reinvested);
+    cash = roundMoney_(available - reinvested);
+    totalInvested = roundMoney_(totalInvested + newMoney);
+    return {
+      date: key,
+      tradeFlow: roundMoney_(proceeds - buy),
+      newMoney: newMoney,
+      reinvested: reinvested,
+      cashBalance: cash,
+      totalInvested: totalInvested
+    };
   });
+}
+
+function cashLedgerNote_(w) {
+  const parts = [];
+  if (w.newMoney > 0) parts.push(`New money ${w.newMoney}`);
+  if (w.reinvested > 0) parts.push(`Reinvested ${w.reinvested}`);
+  if (w.tradeFlow > 0) parts.push("Sale/dividend proceeds kept as cash");
+  return parts.join("; ");
 }
 
 /**
  * Rewrite CashLedger from walked balances. It is a pure function of
- * Trades/CashFlow and cached historical FX, so rewriting it on every sync
- * is reproducible (unlike the old "today's live FX on every past trade").
+ * Trades and cached historical FX, so rewriting it on every sync is
+ * reproducible (unlike the old "today's live FX on every past trade").
  */
 function writeCashLedger_(spreadsheet, walked) {
   const sheet = spreadsheet.getSheetByName("CashLedger");
@@ -135,22 +151,25 @@ function writeCashLedger_(spreadsheet, walked) {
   const rows = walked.map(w => [
     new Date(w.date + "T00:00:00"),
     w.tradeFlow,
-    w.externalFlow,
+    w.newMoney,
     w.cashBalance,
-    w.autoFund > 0 ? `Auto funding ${w.autoFund}` : "Trade + external cash flow"
+    cashLedgerNote_(w),
+    w.reinvested,
+    w.totalInvested
   ]);
 
   const lastRow = sheet.getLastRow();
   if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
-  if (rows.length > 0) sheet.getRange(2, 1, rows.length, 5).setValues(rows);
+  if (rows.length > 0) sheet.getRange(2, 1, rows.length, 7).setValues(rows);
 
   Logger.log(`CashLedger rewritten: ${rows.length} rows.`);
 }
 
 /**
- * Per-date trade cash flow in CNY, from Trades.
+ * Per-date trade cash flow in CNY, from Trades, split into money paid for
+ * buys and money received from sells/dividends (both positive).
  * @param {Function} fxLookup (currency, dateKey) -> rate, or (currency) -> rate
- * @return {Object} dateKey("yyyy-MM-dd") -> tradeCashFlowCNY
+ * @return {Object} dateKey("yyyy-MM-dd") -> { buy, proceeds }
  */
 function getDailyTradeCashFlowsCNY_(spreadsheet, fxLookup) {
   const sheet = spreadsheet.getSheetByName("Trades");
@@ -191,100 +210,16 @@ function getDailyTradeCashFlowsCNY_(spreadsheet, fxLookup) {
     const key = formatDateKey_(row[iDate]);
     const fx = fxLookup(currency, key);
 
-    if (!daily[key]) daily[key] = 0;
+    if (!daily[key]) daily[key] = { buy: 0, proceeds: 0 };
 
     if (side === "BUY") {
-      daily[key] -= (gross + fee + tax + otherCost) * fx;
+      daily[key].buy += (gross + fee + tax + otherCost) * fx;
     } else if (side === "SELL" || side === "DIVIDEND") {
-      daily[key] += (gross - fee - tax - otherCost) * fx;
+      daily[key].proceeds += (gross - fee - tax - otherCost) * fx;
     }
   }
 
   return daily;
-}
-
-/**
- * Per-date manual external cash flow in CNY, from CashFlow (Deposit/Withdrawal).
- * Buys are auto-funded on top of this (see walkCashBalances_), so CashFlow
- * is only needed for withdrawals or cash you want held idle in the account.
- * @param {Function} fxLookup (currency, dateKey) -> rate, or (currency) -> rate
- * @return {Object} dateKey("yyyy-MM-dd") -> externalCashFlowCNY
- */
-function getDailyExternalCashFlowsCNY_(spreadsheet, fxLookup) {
-  const sheet = spreadsheet.getSheetByName("CashFlow");
-  if (!sheet) return {};
-
-  const values = sheet.getDataRange().getValues();
-  if (values.length < 2) return {};
-
-  const header = values[0];
-  const col = name => header.indexOf(name);
-  const iDate = col("Date");
-  const iType = col("Type");
-  const iAmount = col("Amount");
-  const iCurrency = col("Currency");
-
-  if ([iDate, iType, iAmount, iCurrency].some(i => i < 0)) {
-    throw new Error("CashFlow sheet must contain Date, Type, Amount, and Currency columns");
-  }
-
-  const daily = {};
-
-  for (let i = 1; i < values.length; i++) {
-    const row = values[i];
-    if (!row[iDate]) continue;
-
-    const type = String(row[iType] || "").trim().toUpperCase();
-    const amount = Number(row[iAmount]) || 0;
-    if (!type || amount === 0) continue;
-
-    const currency = String(row[iCurrency] || "CNY").trim().toUpperCase();
-    const key = formatDateKey_(row[iDate]);
-    const fx = fxLookup(currency, key);
-    const signed = type === "WITHDRAWAL" ? -Math.abs(amount) * fx : Math.abs(amount) * fx;
-
-    daily[key] = roundMoney_((daily[key] || 0) + signed);
-  }
-
-  return daily;
-}
-
-/**
- * Recompute CashFlow.AmountCNY from Amount/Currency using the unified FX
- * policy, every run (not just when blank) — keeps this column's CNY basis
- * consistent with everything else instead of trusting a manually entered
- * or stale value.
- * @param {Function} fxLookup (currency, dateKey) -> rate, or (currency) -> rate
- */
-function fillCashFlowDerivedFields_(spreadsheet, fxLookup) {
-  const sheet = spreadsheet.getSheetByName("CashFlow");
-  if (!sheet) return;
-
-  const range = sheet.getDataRange();
-  const values = range.getValues();
-  if (values.length < 2) return;
-
-  const header = values[0];
-  const col = name => header.indexOf(name);
-  const iDate = col("Date");
-  const iAmount = col("Amount");
-  const iCurrency = col("Currency");
-  const iAmountCNY = col("AmountCNY");
-
-  if ([iDate, iAmount, iCurrency, iAmountCNY].some(i => i < 0)) {
-    throw new Error("CashFlow sheet must contain Date, Amount, Currency, and AmountCNY columns");
-  }
-
-  const rows = values.slice(1);
-  rows.forEach(row => {
-    if (!row[iDate]) return;
-    const currency = String(row[iCurrency] || "CNY").trim().toUpperCase();
-    const key = formatDateKey_(row[iDate]);
-    const fx = fxLookup(currency, key);
-    row[iAmountCNY] = roundMoney_((Number(row[iAmount]) || 0) * fx);
-  });
-
-  range.setValues([header].concat(rows));
 }
 
 function dateOnlyMs_(d) {
@@ -702,24 +637,23 @@ function shortHash_(text) {
 /**
  * Fingerprint of everything the user entered for each NAV date, stored in
  * NAV_Daily.InputSig. A NAV row whose stored signature differs from the
- * current one was computed from different Trades/CashFlow rows (a trade was
+ * current one was computed from different Trades rows (a trade was
  * back-filled, edited, or deleted) and must be recomputed.
  *
- * Format: "<trade rows>+<cash flow rows>:<hash>", e.g. "2+0:a1b2c3d4".
+ * Format: "<trade rows>:<hash>", e.g. "2:a1b2c3d4".
  * Row order within a day does not matter. Dates without any input have no
  * entry (stored as an empty cell). NAV_CALC_VERSION_ is part of the hash, so
  * bumping it invalidates every row from the first input date.
  *
  * @param {Array<Array>} tradeValues Trades sheet values including header
- * @param {Array<Array>} cashFlowValues CashFlow sheet values including header
  * @return {Object} NAV dateKey -> signature
  */
-function buildDailyInputSignatures_(tradeValues, cashFlowValues) {
+function buildDailyInputSignatures_(tradeValues) {
   const byDate = {};
   const add = (dateValue, kind, fields) => {
     const key = toNavDateKey_(formatDateKey_(dateValue));
-    if (!byDate[key]) byDate[key] = { trades: 0, flows: 0, lines: [] };
-    byDate[key][kind]++;
+    if (!byDate[key]) byDate[key] = { trades: 0, lines: [] };
+    byDate[key].trades++;
     byDate[key].lines.push(kind + "|" + formatDateKey_(dateValue) + "|" + fields.join("|"));
   };
   const text = v => String(v === null || v === undefined ? "" : v).trim().toUpperCase();
@@ -740,25 +674,11 @@ function buildDailyInputSignatures_(tradeValues, cashFlowValues) {
     });
   }
 
-  if (cashFlowValues && cashFlowValues.length > 1) {
-    const header = cashFlowValues[0];
-    const col = name => header.indexOf(name);
-    const iDate = col("Date");
-    const iType = col("Type");
-    const iAmount = col("Amount");
-    const iCurrency = col("Currency");
-
-    cashFlowValues.slice(1).forEach(row => {
-      if (iDate < 0 || !row[iDate]) return;
-      add(row[iDate], "flows", [text(row[iType]), num(row[iAmount]), text(row[iCurrency])]);
-    });
-  }
-
   const signatures = {};
   Object.keys(byDate).forEach(key => {
     const d = byDate[key];
     const hashInput = [NAV_CALC_VERSION_].concat(d.lines.sort()).join("\n");
-    signatures[key] = `${d.trades}+${d.flows}:${shortHash_(hashInput)}`;
+    signatures[key] = `${d.trades}:${shortHash_(hashInput)}`;
   });
   return signatures;
 }
@@ -873,10 +793,10 @@ function getEarliestDateKey_(sheetValuesList) {
 }
 
 /**
- * Bring CashLedger and NAV_Daily in line with Trades/CashFlow.
+ * Bring CashLedger and NAV_Daily in line with Trades.
  *
  * There is no separate "full rebuild": every run compares each NAV row's
- * stored InputSig with the current Trades/CashFlow rows for that date and
+ * stored InputSig with the current Trades rows for that date and
  * recomputes from the first mismatch through today. That covers trades
  * recorded late, edited trades, days the script did not run, and the very
  * first run (no rows yet). To force a rebuild from some date, delete the
@@ -894,19 +814,17 @@ function syncCashAndNavHistory_(spreadsheet, fxMap) {
     throw new Error('Missing sheet: "NAV_Daily" or "Trades"');
   }
 
-  const cashFlowSheet = spreadsheet.getSheetByName("CashFlow");
   const tradeValues = tradesSheet.getDataRange().getValues();
-  const cashFlowValues = cashFlowSheet ? cashFlowSheet.getDataRange().getValues() : [];
 
-  const startKey = getEarliestDateKey_([tradeValues, cashFlowValues]);
+  const startKey = getEarliestDateKey_([tradeValues]);
   if (!startKey) {
-    Logger.log("No Trades or CashFlow data, skip cash/NAV sync.");
+    Logger.log("No Trades data, skip cash/NAV sync.");
     return;
   }
 
   const todayKey = formatDateKey_(getTodayDateOnly_(spreadsheet));
   const weekdayKeys = enumerateWeekdayDateKeys_(startKey, todayKey);
-  const signatures = buildDailyInputSignatures_(tradeValues, cashFlowValues);
+  const signatures = buildDailyInputSignatures_(tradeValues);
   const firstDirty = findFirstDirtyIndex_(weekdayKeys, readNavRows_(navSheet), signatures, todayKey);
   if (firstDirty === -1) {
     Logger.log("NAV_Daily is up to date, nothing to recompute.");
@@ -920,16 +838,12 @@ function syncCashAndNavHistory_(spreadsheet, fxMap) {
     : "Trimming extra NAV_Daily rows.");
 
   const pastWeekdayKeys = weekdayKeys.filter(k => k < todayKey);
-  if (pastWeekdayKeys.length > 0 &&
-      (hasForeignCurrency_(tradeValues) || hasForeignCurrency_(cashFlowValues))) {
+  if (pastWeekdayKeys.length > 0 && hasForeignCurrency_(tradeValues)) {
     ensureFxHistoryCached_(spreadsheet, startKey, pastWeekdayKeys[pastWeekdayKeys.length - 1]);
   }
   const fxLookup = makeSyncFxLookup_(loadFxHistoryMap_(spreadsheet), fxMap, todayKey);
 
-  fillCashFlowDerivedFields_(spreadsheet, fxLookup);
-  const tradeFlows = getDailyTradeCashFlowsCNY_(spreadsheet, fxLookup);
-  const externalFlows = getDailyExternalCashFlowsCNY_(spreadsheet, fxLookup);
-  const walked = walkCashBalances_(tradeFlows, externalFlows);
+  const walked = walkCashBalances_(getDailyTradeCashFlowsCNY_(spreadsheet, fxLookup));
   writeCashLedger_(spreadsheet, walked);
 
   const holdingsByDate = buildHoldingsByDate_(tradeValues, dirtyKeys);
@@ -993,12 +907,12 @@ function computeNavRows_(input) {
       quality = pending ? NAV_QUALITY_PENDING_ : (estimated ? "ESTIMATED" : "");
     }
 
-    // External flows (manual + auto funding) since the previous NAV row,
-    // including any dated on the weekend/gap in between.
+    // New money put in since the previous NAV row, including any dated on
+    // the weekend/gap in between.
     let externalFlow = 0;
     while (cashIdx + 1 < cashKeys.length && cashKeys[cashIdx + 1] <= key) {
       cashIdx++;
-      if (cashKeys[cashIdx] > prevKey) externalFlow += input.walked[cashIdx].externalFlow;
+      if (cashKeys[cashIdx] > prevKey) externalFlow += input.walked[cashIdx].newMoney;
     }
     externalFlow = roundMoney_(externalFlow);
     const cashBalance = cashIdx >= 0 ? input.walked[cashIdx].cashBalance : 0;
@@ -1078,7 +992,10 @@ function setupPnLViewFormula_(spreadsheet) {
     ["Today Return", '=IFERROR(INDEX(FILTER(NAV_Daily!H2:H,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!H2:H,NAV_Daily!A2:A<>""))),0)', "Trading return after external cash flow"],
     ["MTD PnL", '=IFERROR(SUM(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A>=EOMONTH(TODAY(),-1)+1,NAV_Daily!A2:A<=TODAY())),0)', "Month-to-date trading PnL"],
     ["YTD PnL", '=IFERROR(SUM(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A>=DATE(YEAR(TODAY()),1,1),NAV_Daily!A2:A<=TODAY())),0)', "Year-to-date trading PnL"],
-    ["Optional Since Inception XIRR", '=IFERROR(XIRR({FILTER(CashLedger!C2:C,CashLedger!A2:A<>"",CashLedger!C2:C<>0);-INDEX(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>"")))},{FILTER(CashLedger!A2:A,CashLedger!A2:A<>"",CashLedger!C2:C<>0);INDEX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>"")))}),"")', "Optional money-weighted reference"]
+    ["Optional Since Inception XIRR", '=IFERROR(XIRR({FILTER(CashLedger!C2:C,CashLedger!A2:A<>"",CashLedger!C2:C<>0);-INDEX(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>"")))},{FILTER(CashLedger!A2:A,CashLedger!A2:A<>"",CashLedger!C2:C<>0);INDEX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>"")))}),"")', "Optional money-weighted reference"],
+    ["Total Invested (CNY)", '=SUM(CashLedger!C2:C)', "Real money put in (auto-funded buys)"],
+    ["Total PnL (CNY)", '=B3-B10', "Total asset minus money put in"],
+    ["Total Return", '=IF(B10=0,,B11/B10)', "Total PnL / Total Invested"]
   ];
 
   sheet.getRange(2, 1, rows.length, 3).setValues(rows);

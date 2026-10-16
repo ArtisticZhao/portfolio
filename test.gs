@@ -63,33 +63,28 @@ function testBuildPositionsFromTradesWeightedCost_() {
 }
 
 /**
- * Auto funding: a shortfall is covered by exactly the missing amount, and
- * cash left over from sales funds later buys before any new money is added.
+ * Buys are paid from cash on hand (earlier proceeds) first; only the rest
+ * is new money. Cash never goes negative.
  */
 function testWalkCashBalancesAutoFunding_() {
-  const tradeFlows = {
-    "2026-01-01": -100,
-    "2026-01-02": 40,
-    "2026-01-03": -60,
-    "2026-01-05": -30
-  };
-  const externalFlows = {
-    "2026-01-01": 50,
-    "2026-01-04": -5
-  };
-
-  const rows = walkCashBalances_(tradeFlows, externalFlows);
-  assertAlmostEqual_(rows[0].autoFund, 50, "day 1 auto funds the shortfall after manual deposit");
-  assertAlmostEqual_(rows[0].externalFlow, 100, "day 1 external = manual + auto");
+  const rows = walkCashBalances_({
+    "2026-01-01": { buy: 100, proceeds: 0 },
+    "2026-01-02": { buy: 0, proceeds: 40 },
+    "2026-01-03": { buy: 60, proceeds: 0 },
+    "2026-01-05": { buy: 30, proceeds: 50 }
+  });
+  assertAlmostEqual_(rows[0].newMoney, 100, "first buy is all new money");
+  assertAlmostEqual_(rows[0].reinvested, 0, "nothing to reinvest yet");
   assertAlmostEqual_(rows[0].cashBalance, 0, "day 1 balance");
   assertAlmostEqual_(rows[1].cashBalance, 40, "sale proceeds stay in the account");
-  assertAlmostEqual_(rows[2].autoFund, 20, "buy uses cash on hand first");
+  assertAlmostEqual_(rows[1].tradeFlow, 40, "net trade flow");
+  assertAlmostEqual_(rows[2].reinvested, 40, "buy uses cash on hand first");
+  assertAlmostEqual_(rows[2].newMoney, 20, "only the shortfall is new money");
   assertAlmostEqual_(rows[2].cashBalance, 0, "day 3 balance");
-  assertAlmostEqual_(rows[3].autoFund, 5, "withdrawal below zero is refilled");
-  assertAlmostEqual_(rows[4].autoFund, 30, "day 5 auto funding");
-  rows.forEach(r => {
-    if (r.cashBalance < 0) throw new Error(`negative cash on ${r.date}`);
-  });
+  assertAlmostEqual_(rows[3].reinvested, 30, "same-day sale funds the buy");
+  assertAlmostEqual_(rows[3].newMoney, 0, "no new money needed");
+  assertAlmostEqual_(rows[3].cashBalance, 20, "day 5 balance");
+  assertAlmostEqual_(rows[3].totalInvested, 120, "total real money put in");
 }
 
 function assertEqual_(actual, expected, label) {
@@ -113,38 +108,37 @@ function testDailyInputSignatures_() {
   const sell = testTradeRow_("2026-10-09", "600519", "SELL", 100, 11);
   const late = testTradeRow_("2026-10-08", "000001", "BUY", 200, 5);
 
-  const base = buildDailyInputSignatures_([TEST_TRADE_HEADER_, buy, sell], []);
-  assertEqual_(base["2026-10-08"].split(":")[0], "1+0", "one trade counted");
+  const base = buildDailyInputSignatures_([TEST_TRADE_HEADER_, buy, sell]);
+  assertEqual_(base["2026-10-08"].split(":")[0], "1", "one trade counted");
   assertEqual_(base["2026-10-07"], undefined, "no signature without input");
 
-  const backfilled = buildDailyInputSignatures_([TEST_TRADE_HEADER_, buy, sell, late], []);
-  assertEqual_(backfilled["2026-10-08"].split(":")[0], "2+0", "back-filled trade counted");
+  const backfilled = buildDailyInputSignatures_([TEST_TRADE_HEADER_, buy, sell, late]);
+  assertEqual_(backfilled["2026-10-08"].split(":")[0], "2", "back-filled trade counted");
   assertEqual_(backfilled["2026-10-09"], base["2026-10-09"], "other day untouched");
 
-  const reordered = buildDailyInputSignatures_([TEST_TRADE_HEADER_, late, sell, buy], []);
+  const reordered = buildDailyInputSignatures_([TEST_TRADE_HEADER_, late, sell, buy]);
   assertEqual_(reordered["2026-10-08"], backfilled["2026-10-08"], "row order ignored");
 
   const edited = buildDailyInputSignatures_(
-    [TEST_TRADE_HEADER_, testTradeRow_("2026-10-08", "600519", "BUY", 100, 10.5), sell], []
+    [TEST_TRADE_HEADER_, testTradeRow_("2026-10-08", "600519", "BUY", 100, 10.5), sell]
   );
-  assertEqual_(edited["2026-10-08"].split(":")[0], "1+0", "edit keeps the count");
+  assertEqual_(edited["2026-10-08"].split(":")[0], "1", "edit keeps the count");
   assertEqual_(edited["2026-10-08"] !== base["2026-10-08"], true, "edited price changes signature");
 
   // 2026-10-10 is a Saturday: accounted for on Monday's NAV row.
   const weekend = buildDailyInputSignatures_(
-    [TEST_TRADE_HEADER_],
-    [["Date", "Type", "Amount", "Currency"], [new Date("2026-10-10T00:00:00"), "Deposit", 1000, "CNY"]]
+    [TEST_TRADE_HEADER_, testTradeRow_("2026-10-10", "600519", "BUY", 100, 10)]
   );
-  assertEqual_(weekend["2026-10-12"].split(":")[0], "0+1", "weekend flow rolls to Monday");
+  assertEqual_(weekend["2026-10-12"].split(":")[0], "1", "weekend trade rolls to Monday");
 }
 
 function testFindFirstDirtyIndex_() {
   const keys = ["2026-10-08", "2026-10-09", "2026-10-12", "2026-10-13"];
-  const sigs = { "2026-10-08": "1+0:aaaaaaaa", "2026-10-12": "2+0:bbbbbbbb" };
+  const sigs = { "2026-10-08": "1:aaaaaaaa", "2026-10-12": "2:bbbbbbbb" };
   const nav = () => [
-    { dateKey: "2026-10-08", quality: "", sig: "1+0:aaaaaaaa" },
+    { dateKey: "2026-10-08", quality: "", sig: "1:aaaaaaaa" },
     { dateKey: "2026-10-09", quality: "", sig: "" },
-    { dateKey: "2026-10-12", quality: "", sig: "2+0:bbbbbbbb" }
+    { dateKey: "2026-10-12", quality: "", sig: "2:bbbbbbbb" }
   ];
 
   // Weekend run with nothing new: fully up to date.
@@ -153,11 +147,11 @@ function testFindFirstDirtyIndex_() {
   assertEqual_(findFirstDirtyIndex_(keys, nav(), sigs, "2026-10-13"), 3, "today only");
 
   // A trade back-filled on 10-09 after that row was computed.
-  const backfilled = Object.assign({}, sigs, { "2026-10-09": "1+0:cccccccc" });
+  const backfilled = Object.assign({}, sigs, { "2026-10-09": "1:cccccccc" });
   assertEqual_(findFirstDirtyIndex_(keys, nav(), backfilled, "2026-10-13"), 1, "back-fill");
 
   // The only trade of a day was deleted.
-  const deleted = { "2026-10-12": "2+0:bbbbbbbb" };
+  const deleted = { "2026-10-12": "2:bbbbbbbb" };
   assertEqual_(findFirstDirtyIndex_(keys, nav(), deleted, "2026-10-13"), 0, "deletion");
 
   // Script did not run on 10-09: the row is missing.
@@ -189,8 +183,7 @@ function testComputeNavRowsAfterBackfill_() {
   assertAlmostEqual_(holdings["2026-10-09"]["600519"].quantity, 50, "day 2 holding");
 
   const prices = { "2026-10-08": 11, "2026-10-09": 12 };
-  const tradeFlows = { "2026-10-08": -1005, "2026-10-09": 595 };
-  const externalFlows = { "2026-10-08": 2000 };
+  const tradeFlows = { "2026-10-08": { buy: 1005, proceeds: 0 }, "2026-10-09": { buy: 0, proceeds: 595 } };
 
   const rows = computeNavRows_({
     dateKeys: keys,
@@ -200,22 +193,22 @@ function testComputeNavRowsAfterBackfill_() {
     holdingsByDate: holdings,
     priceLookup: (symbol, key) => ({ price: prices[key], settled: true }),
     fxLookup: () => 1,
-    walked: walkCashBalances_(tradeFlows, externalFlows),
-    signatures: { "2026-10-08": "1+0:aaaaaaaa" }
+    walked: walkCashBalances_(tradeFlows),
+    signatures: { "2026-10-08": "1:aaaaaaaa" }
   });
 
   assertAlmostEqual_(rows[0].equity, 1100, "day 1 equity");
-  assertAlmostEqual_(rows[0].cashBalance, 995, "day 1 cash");
-  assertAlmostEqual_(rows[0].externalFlow, 2000, "day 1 external flow");
+  assertAlmostEqual_(rows[0].cashBalance, 0, "day 1 cash");
+  assertAlmostEqual_(rows[0].externalFlow, 1005, "day 1 external flow");
   assertAlmostEqual_(rows[1].equity, 600, "day 2 equity");
-  assertAlmostEqual_(rows[1].totalAsset, 2190, "day 2 total asset");
-  assertEqual_(rows[0].sig, "1+0:aaaaaaaa", "signature stored");
+  assertAlmostEqual_(rows[1].totalAsset, 1195, "day 2 total asset");
+  assertEqual_(rows[0].sig, "1:aaaaaaaa", "signature stored");
   assertEqual_(rows[1].quality, "", "settled close is final");
 }
 
 /**
- * Pure auto funding through NAV: a buy's auto-funded amount is external
- * flow, so it does not show up as trading PnL. Starting mid-history only
+ * Auto funding through NAV: a buy's new money is external flow, so it does
+ * not show up as trading PnL. Starting mid-history only
  * counts flows after prevDateKey.
  */
 function testComputeNavRowsAutoFunding_() {
@@ -228,7 +221,11 @@ function testComputeNavRowsAutoFunding_() {
   ];
   const holdings = buildHoldingsByDate_(trades, keys);
   const prices = { "2026-10-08": 11, "2026-10-09": 12, "2026-10-12": 12 };
-  const walked = walkCashBalances_({ "2026-10-08": -1005, "2026-10-09": 595, "2026-10-12": -1205 }, {});
+  const walked = walkCashBalances_({
+    "2026-10-08": { buy: 1005, proceeds: 0 },
+    "2026-10-09": { buy: 0, proceeds: 595 },
+    "2026-10-12": { buy: 1205, proceeds: 0 }
+  });
   const input = {
     dateKeys: keys,
     prevDateKey: "",
