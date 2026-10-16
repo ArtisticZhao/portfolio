@@ -15,8 +15,9 @@ const NAV_CALC_VERSION_ = "auto-funding-1";
  * Sheets:
  * - CashLedger: cash generated from Trades alone; buys are auto-funded, so
  *   NewMoneyCNY is the real money put in (see walkCashBalances_)
- * - NAV_Daily: daily account snapshot in CNY; InputSig records which
- *   Trades rows each row was computed from (see syncCashAndNavHistory_)
+ * - NAV_Daily: daily account snapshot in CNY, newest date in row 2;
+ *   InputSig records which Trades rows each row was computed from
+ *   (see syncCashAndNavHistory_)
  * - PnL_View: dashboard formulas
  * - FxHistory / PriceHistory: cache sheets for historical closes
  */
@@ -709,17 +710,28 @@ function findFirstDirtyIndex_(weekdayKeys, navRows, signatures, todayKey) {
   return navRows.length > weekdayKeys.length ? weekdayKeys.length : -1;
 }
 
+/**
+ * Read NAV_Daily rows, returned oldest first regardless of sheet order.
+ * The sheet keeps the newest date in row 2; sheets written by older code
+ * are oldest-first and are flagged so the sync rewrites them once.
+ * @return {{rows: Array<Object>, legacyOrder: boolean}} rows carry
+ *   { dateKey, quality, sig, values } where values are columns A:E,I:J
+ */
 function readNavRows_(navSheet) {
   const lastRow = navSheet.getLastRow();
-  if (lastRow < 2) return [];
+  if (lastRow < 2) return { rows: [], legacyOrder: false };
 
-  const rows = navSheet.getRange(2, 1, lastRow - 1, NAV_COLUMN_COUNT_).getValues().map(row => ({
-    dateKey: row[0] ? formatDateKey_(row[0]) : "",
-    quality: String(row[8] || "").trim(),
-    sig: String(row[9] || "").trim()
-  }));
-  while (rows.length > 0 && !rows[rows.length - 1].dateKey) rows.pop();
-  return rows;
+  const rows = navSheet.getRange(2, 1, lastRow - 1, NAV_COLUMN_COUNT_).getValues()
+    .filter(row => row[0])
+    .map(row => ({
+      dateKey: formatDateKey_(row[0]),
+      quality: String(row[8] || "").trim(),
+      sig: String(row[9] || "").trim(),
+      values: row.slice(0, 5).concat([row[8], row[9]])
+    }));
+  const legacyOrder = rows.length > 1 && rows[0].dateKey < rows[rows.length - 1].dateKey;
+  if (!legacyOrder) rows.reverse();
+  return { rows: rows, legacyOrder: legacyOrder };
 }
 
 /**
@@ -825,10 +837,15 @@ function syncCashAndNavHistory_(spreadsheet, fxMap) {
   const todayKey = formatDateKey_(getTodayDateOnly_(spreadsheet));
   const weekdayKeys = enumerateWeekdayDateKeys_(startKey, todayKey);
   const signatures = buildDailyInputSignatures_(tradeValues);
-  const firstDirty = findFirstDirtyIndex_(weekdayKeys, readNavRows_(navSheet), signatures, todayKey);
+  const nav = readNavRows_(navSheet);
+  let firstDirty = findFirstDirtyIndex_(weekdayKeys, nav.rows, signatures, todayKey);
   if (firstDirty === -1) {
-    Logger.log("NAV_Daily is up to date, nothing to recompute.");
-    return;
+    if (!nav.legacyOrder) {
+      Logger.log("NAV_Daily is up to date, nothing to recompute.");
+      return;
+    }
+    // Nothing to recompute, but the rows still need flipping to newest-first.
+    firstDirty = weekdayKeys.length;
   }
 
   const dirtyKeys = weekdayKeys.slice(firstDirty);
@@ -873,8 +890,8 @@ function syncCashAndNavHistory_(spreadsheet, fxMap) {
     signatures: signatures
   });
 
-  writeNavRows_(navSheet, firstDirty + 2, rows);
-  Logger.log(`NAV_Daily synced: ${rows.length} rows written.`);
+  writeNavRows_(navSheet, nav.rows.slice(0, firstDirty).map(r => r.values), rows);
+  Logger.log(`NAV_Daily synced: ${rows.length} rows recomputed.`);
 }
 
 /**
@@ -931,36 +948,48 @@ function computeNavRows_(input) {
 }
 
 /**
- * Overwrite NAV_Daily from startRow down with the given rows and clear
- * whatever was below. Rows above startRow are left untouched.
+ * Rewrite NAV_Daily newest-first: the recomputed rows on top, the kept
+ * older rows below them, and clear whatever was below that. Rows are
+ * rewritten in place (no insert/delete) so references to NAV_Daily!A2:A
+ * elsewhere stay put.
+ *
+ * @param {Array<Array>} keptValues unchanged rows, oldest first, as
+ *   columns A:E,I:J (see readNavRows_)
+ * @param {Array<Object>} rows recomputed rows, oldest first (computeNavRows_)
  */
-function writeNavRows_(navSheet, startRow, rows) {
-  const lastRow = navSheet.getLastRow();
-  if (lastRow >= startRow) {
-    navSheet.getRange(startRow, 1, lastRow - startRow + 1, NAV_COLUMN_COUNT_).clearContent();
-  }
-  if (rows.length === 0) return;
-
-  navSheet.getRange(startRow, 1, rows.length, 5).setValues(rows.map(r => [
+function writeNavRows_(navSheet, keptValues, rows) {
+  const all = keptValues.concat(rows.map(r => [
     new Date(r.dateKey + "T00:00:00"),
     r.equity,
     r.cashBalance,
     r.externalFlow,
-    r.totalAsset
-  ]));
+    r.totalAsset,
+    r.quality,
+    r.sig
+  ])).reverse();
 
-  // Derived columns F:G:H. The first NAV row has no previous day.
-  navSheet.getRange(startRow, 6, rows.length, 3).setFormulas(rows.map((_, i) => {
-    const r = startRow + i;
-    if (r === 2) return ["", "", ""];
+  const lastRow = navSheet.getLastRow();
+  if (lastRow >= 2) {
+    navSheet.getRange(2, 1, lastRow - 1, NAV_COLUMN_COUNT_).clearContent();
+  }
+  if (all.length === 0) return;
+
+  navSheet.getRange(2, 1, all.length, 5).setValues(all.map(v => v.slice(0, 5)));
+
+  // Derived columns F:G:H. The previous day is the row below; the oldest
+  // (last) row has none.
+  const oldestRow = all.length + 1;
+  navSheet.getRange(2, 6, all.length, 3).setFormulas(all.map((_, i) => {
+    const r = 2 + i;
+    if (r === oldestRow) return ["", "", ""];
     return [
-      `=E${r - 1}`,
+      `=E${r + 1}`,
       `=E${r}-F${r}-D${r}`,
       `=IF(F${r}+D${r}=0,,G${r}/(F${r}+D${r}))`
     ];
   }));
 
-  navSheet.getRange(startRow, 9, rows.length, 2).setValues(rows.map(r => [r.quality, r.sig]));
+  navSheet.getRange(2, 9, all.length, 2).setValues(all.map(v => v.slice(5, 7)));
 }
 
 function getTodayDateOnly_(spreadsheet) {
@@ -985,14 +1014,14 @@ function setupPnLViewFormula_(spreadsheet) {
   }
 
   const rows = [
-    ["Latest Trading Date", '=IFERROR(INDEX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>""))),"")', "NAV_Daily latest date"],
-    ["Total Asset (CNY)", '=IFERROR(INDEX(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>""))),0)', "Latest equity plus cash"],
-    ["Cash Balance (CNY)", '=IFERROR(INDEX(FILTER(NAV_Daily!C2:C,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!C2:C,NAV_Daily!A2:A<>""))),0)', "Latest generated cash balance"],
-    ["Today PnL", '=IFERROR(INDEX(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A<>""))),0)', "Trading PnL after external cash flow"],
-    ["Today Return", '=IFERROR(INDEX(FILTER(NAV_Daily!H2:H,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!H2:H,NAV_Daily!A2:A<>""))),0)', "Trading return after external cash flow"],
+    ["Latest Trading Date", '=IF(COUNT(NAV_Daily!A2:A)=0,"",MAX(NAV_Daily!A2:A))', "NAV_Daily latest date"],
+    ["Total Asset (CNY)", '=IFERROR(XLOOKUP(MAX(NAV_Daily!A2:A),NAV_Daily!A2:A,NAV_Daily!E2:E),0)', "Latest equity plus cash"],
+    ["Cash Balance (CNY)", '=IFERROR(XLOOKUP(MAX(NAV_Daily!A2:A),NAV_Daily!A2:A,NAV_Daily!C2:C),0)', "Latest generated cash balance"],
+    ["Today PnL", '=IFERROR(XLOOKUP(MAX(NAV_Daily!A2:A),NAV_Daily!A2:A,NAV_Daily!G2:G),0)', "Trading PnL after external cash flow"],
+    ["Today Return", '=IFERROR(XLOOKUP(MAX(NAV_Daily!A2:A),NAV_Daily!A2:A,NAV_Daily!H2:H),0)', "Trading return after external cash flow"],
     ["MTD PnL", '=IFERROR(SUM(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A>=EOMONTH(TODAY(),-1)+1,NAV_Daily!A2:A<=TODAY())),0)', "Month-to-date trading PnL"],
     ["YTD PnL", '=IFERROR(SUM(FILTER(NAV_Daily!G2:G,NAV_Daily!A2:A>=DATE(YEAR(TODAY()),1,1),NAV_Daily!A2:A<=TODAY())),0)', "Year-to-date trading PnL"],
-    ["Optional Since Inception XIRR", '=IFERROR(XIRR({FILTER(CashLedger!C2:C,CashLedger!A2:A<>"",CashLedger!C2:C<>0);-INDEX(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!E2:E,NAV_Daily!A2:A<>"")))},{FILTER(CashLedger!A2:A,CashLedger!A2:A<>"",CashLedger!C2:C<>0);INDEX(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>""),ROWS(FILTER(NAV_Daily!A2:A,NAV_Daily!A2:A<>"")))}),"")', "Optional money-weighted reference"],
+    ["Optional Since Inception XIRR", '=IFERROR(XIRR({FILTER(CashLedger!C2:C,CashLedger!A2:A<>"",CashLedger!C2:C<>0);-XLOOKUP(MAX(NAV_Daily!A2:A),NAV_Daily!A2:A,NAV_Daily!E2:E)},{FILTER(CashLedger!A2:A,CashLedger!A2:A<>"",CashLedger!C2:C<>0);MAX(NAV_Daily!A2:A)}),"")', "Optional money-weighted reference"],
     ["Total Invested (CNY)", '=SUM(CashLedger!C2:C)', "Real money put in (auto-funded buys)"],
     ["Total PnL (CNY)", '=B3-B10', "Total asset minus money put in"],
     ["Total Return", '=IF(B10=0,,B11/B10)', "Total PnL / Total Invested"]

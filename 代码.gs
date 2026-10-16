@@ -17,6 +17,7 @@ function runDailyPortfolioUpdate() {
   fillPositionsFromTrades_(doc);
   const symbolInfoMap = updatePositionsPrices_(doc);
   fillTradesNameFromSymbol_(doc, symbolInfoMap);
+  sortPositionsRows_(doc);
 
   // Fetch live FX once per run (throws rather than silently defaulting to
   // 1:1 — see getFxToCnyMap_). The sync below detects trades recorded late
